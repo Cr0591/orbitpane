@@ -27,6 +27,8 @@ interface MessageRowProps {
   message: Message
   rowKey: string
   isCopied: boolean
+  /** False for the rows already present when the transcript first rendered. */
+  animateEntry: boolean
   isLastAgentMessage: boolean
   copyMessageText: (text: string, messageKey: string) => void
   handleFeedback: (messageId: number | undefined, type: 'up' | 'down') => void
@@ -101,6 +103,7 @@ const MessageRow = React.memo(function MessageRow({
   message,
   rowKey,
   isCopied,
+  animateEntry,
   isLastAgentMessage,
   copyMessageText,
   handleFeedback,
@@ -116,7 +119,7 @@ const MessageRow = React.memo(function MessageRow({
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 6 }}
+      initial={animateEntry ? { opacity: 0, y: 6 } : false}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2 }}
       className={`message-row ${message.role}`}
@@ -270,6 +273,19 @@ export function MessageList({
   const latestSummaryKey = latestSummaryIndex >= 0
     ? messageKey(messages[latestSummaryIndex], latestSummaryIndex)
     : null
+  /**
+   * Whether a row mounting now is arriving into a transcript already on screen.
+   *
+   * Opening a long conversation mounts every message at once, and giving each
+   * of them an entry animation meant hundreds of simultaneous animations
+   * competing for the first frames after the switch. A transcript that is
+   * already there should simply be there; only what arrives afterwards is
+   * worth animating in.
+   */
+  const hasRenderedRef = React.useRef(false)
+  React.useEffect(() => {
+    hasRenderedRef.current = true
+  }, [])
   const [expandedHistoryKey, setExpandedHistoryKey] = React.useState<string | null>(null)
   const [expandedSummaryKey, setExpandedSummaryKey] = React.useState<string | null>(null)
   const [contextMessageKey, setContextMessageKey] = React.useState<string | null>(null)
@@ -313,7 +329,7 @@ export function MessageList({
   React.useEffect(() => {
     const isThinking = messages.some(message => message.role === 'agent' && message.isThinking)
     if (wasThinkingRef.current && !isThinking) {
-      const lastAgent = [...messages].reverse().find(message => message.role === 'agent')
+      const lastAgent = messages.findLast(message => message.role === 'agent')
       setLiveAnnouncement(
         lastAgent?.content
           ? `回答已生成，共 ${lastAgent.content.length} 字`
@@ -436,7 +452,7 @@ export function MessageList({
           return (
             <motion.section
               key={key}
-              initial={{ opacity: 0, y: 6 }}
+              initial={hasRenderedRef.current ? { opacity: 0, y: 6 } : false}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.2 }}
               className={`conversation-summary-boundary ${isLatestSummary ? 'latest' : ''}`}
@@ -521,6 +537,7 @@ export function MessageList({
             rowKey={key}
             message={m}
             isCopied={copiedMessageKey === key}
+            animateEntry={hasRenderedRef.current}
             isLastAgentMessage={key === lastAgentKey}
             copyMessageText={copyMessageText}
             handleFeedback={handleFeedback}

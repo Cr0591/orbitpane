@@ -311,3 +311,46 @@ class CodexRunTests(IsolatedAsyncioTestCase):
         )
         command = create_process.await_args.args
         self.assertIn('model_reasoning_summary="detailed"', command)
+
+
+class CodexAvailabilityTests(IsolatedAsyncioTestCase):
+    """Availability must not depend on a probe that has not run yet."""
+
+    def _provider(self) -> CodexCliProvider:
+        return CodexCliProvider(
+            replace(Settings.from_env(), codex_enabled=True, codex_models=())
+        )
+
+    async def test_available_before_the_first_probe(self) -> None:
+        provider = self._provider()
+        with patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"):
+            # A project created in the window between a restart and the startup
+            # prewarm landing must not be rejected.
+            self.assertTrue(provider.available)
+
+    async def test_unavailable_once_a_probe_reports_no_models(self) -> None:
+        provider = self._provider()
+        with (
+            patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"),
+            patch("backend.app.agents.codex.fetch_codex_models", return_value=()),
+        ):
+            await provider.ensure_model_catalog()
+            self.assertFalse(provider.available)
+
+    async def test_available_once_a_probe_reports_models(self) -> None:
+        provider = self._provider()
+        with (
+            patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"),
+            patch(
+                "backend.app.agents.codex.fetch_codex_models",
+                return_value=(("gpt-test", "GPT Test"),),
+            ),
+        ):
+            await provider.ensure_model_catalog()
+            self.assertTrue(provider.available)
+            self.assertEqual(provider.models, ("gpt-test",))
+
+    async def test_disabled_provider_stays_unavailable(self) -> None:
+        provider = CodexCliProvider(replace(Settings.from_env(), codex_enabled=False))
+        with patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"):
+            self.assertFalse(provider.available)

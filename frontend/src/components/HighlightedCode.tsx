@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter'
 import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash'
 import css from 'react-syntax-highlighter/dist/esm/languages/prism/css'
@@ -46,7 +47,11 @@ interface HighlightedCodeProps {
   wrapLongLines?: boolean
 }
 
-export default function HighlightedCode({
+/**
+ * Memoised: Prism tokenises the whole block on every render, and a long answer
+ * can carry several of them.
+ */
+function HighlightedCode({
   code,
   language,
   theme,
@@ -72,3 +77,5 @@ export default function HighlightedCode({
     </SyntaxHighlighter>
   )
 }
+
+export default memo(HighlightedCode)

@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import subprocess
-import time
 
 from ..config import Settings
 from .base import (
@@ -14,6 +13,8 @@ from .base import (
     AgentRequest,
     AgentResult,
     EmitEvent,
+    ModelCatalog,
+    ModelCatalogCache,
     ProviderError,
     empty_output_error,
     humanize_model_id,
@@ -21,7 +22,7 @@ from .base import (
 from .process import terminate_process
 
 
-def fetch_codex_models(command: str = "codex") -> tuple[tuple[str, str], ...]:
+def fetch_codex_models(command: str = "codex") -> ModelCatalog:
     """Read the (model slug, display name) pairs exposed by the Codex CLI."""
     try:
         res = subprocess.run(
@@ -65,41 +66,39 @@ class CodexCliProvider(AgentProvider):
     display_name = "ChatGPT Codex"
     tone = "codex"
     _REASONING_SUMMARIES = frozenset({"auto", "concise", "detailed", "none"})
-    _CACHE_TTL_SECONDS = 300
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._interrupted: set[int] = set()
-        self._cached_models: tuple[str, ...] | None = None
-        self._cached_at: float = 0
-        self._model_labels: dict[str, str] = {}
+        self._catalog = ModelCatalogCache(
+            self.id,
+            fetch=lambda: fetch_codex_models(self.settings.codex_command),
+            fallback=lambda: self.settings.codex_models,
+        )
+
+    @property
+    def _models_are_pinned(self) -> bool:
+        """An explicit CODEX_MODELS overrides whatever the CLI reports."""
+        return bool(os.getenv("CODEX_MODELS"))
 
     @property
     def models(self) -> tuple[str, ...]:
-        if os.getenv("CODEX_MODELS"):
+        if self._models_are_pinned:
             return self.settings.codex_models
-        now = time.monotonic()
-        if (
-            self._cached_models is None
-            or (now - self._cached_at) > self._CACHE_TTL_SECONDS
-        ):
-            fetched = fetch_codex_models(self.settings.codex_command)
-            if fetched:
-                self._model_labels = {model: label for model, label in fetched}
-                self._cached_models = tuple(model for model, _ in fetched)
-                self._cached_at = now
-            elif self._cached_models is None:
-                self._cached_models = self.settings.codex_models
-                self._cached_at = now
-            else:
-                self._cached_at = now
-        return self._cached_models
+        return self._catalog.models
+
+    async def ensure_model_catalog(self) -> None:
+        # A disabled provider is never selectable, so probing its CLI would be
+        # a subprocess spawned for nothing on every catalog read.
+        if not self.settings.codex_enabled or self._models_are_pinned:
+            return
+        await self._catalog.ensure_fresh()
 
     def model_display_name(self, model: str) -> str:
-        if not self._model_labels:
-            _ = self.models
-        return self._model_labels.get(model) or humanize_model_id(model)
+        if self._models_are_pinned:
+            return humanize_model_id(model)
+        return self._catalog.display_name(model)
 
     def validate_model(self, model: str) -> str:
         if not self.models:
@@ -110,11 +109,18 @@ class CodexCliProvider(AgentProvider):
 
     @property
     def available(self) -> bool:
-        return (
-            self.settings.codex_enabled
-            and bool(self.models)
-            and shutil.which(self.settings.codex_command) is not None
-        )
+        if not self.settings.codex_enabled:
+            return False
+        if shutil.which(self.settings.codex_command) is None:
+            return False
+        if self._models_are_pinned or not self._catalog.has_probed:
+            # No probe has run yet, so an empty catalog is absence of evidence
+            # rather than evidence of absence — refusing here would reject a
+            # project created in the seconds between a restart and the startup
+            # prewarm landing. An empty catalog *after* a probe is real: the
+            # CLI has nothing to offer, usually because it is not signed in.
+            return True
+        return bool(self.models)
 
     def _permission_args(self, permission_mode: str) -> list[str]:
         if permission_mode == "unrestricted":

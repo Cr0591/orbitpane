@@ -64,7 +64,24 @@ function ResponsiveTable({ children, ...props }: React.TableHTMLAttributes<HTMLT
   )
 }
 
-export default function MarkdownContent({
+/* Hoisted: a fresh plugin array or components map on every render makes
+   react-markdown re-parse and rebuild the tree even when the text is
+   unchanged. */
+const REMARK_PLUGINS = [remarkGfm, remarkMath]
+const REHYPE_PLUGINS = [rehypeKatex]
+const PROSE_COMPONENTS = { table: ResponsiveTable }
+const CODE_COMPONENTS = { table: ResponsiveTable, code: CodeBlock }
+
+/**
+ * Memoised on the text alone.
+ *
+ * Parsing markdown, laying out KaTeX and highlighting code is the expensive
+ * half of rendering a transcript, and in a long conversation the great
+ * majority of messages are finished and will never change again. Anything that
+ * re-renders a row for another reason — a copy tick, a feedback vote, a
+ * streamed token in the turn below — must not pay to rebuild them.
+ */
+function MarkdownContent({
   content,
   enableCodeBlocks = false,
 }: MarkdownContentProps) {
@@ -72,14 +89,13 @@ export default function MarkdownContent({
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeKatex]}
-      components={{
-        table: ResponsiveTable,
-        ...(enableCodeBlocks ? { code: CodeBlock } : {}),
-      }}
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={REHYPE_PLUGINS}
+      components={enableCodeBlocks ? CODE_COMPONENTS : PROSE_COMPONENTS}
     >
       {processedContent}
     </ReactMarkdown>
   )
 }
+
+export default React.memo(MarkdownContent)

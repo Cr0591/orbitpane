@@ -386,7 +386,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         database.migrate()
         sweeper = asyncio.create_task(sweep_dead_shares())
+        # Discovering models means shelling out to each agent CLI, so it runs
+        # here rather than under the first request: a client that opens the app
+        # right after a restart finds the caches already filled. Startup is not
+        # held up for it — the probe resolves in the background while the
+        # server is already answering.
+        prewarm = asyncio.create_task(providers.prewarm())
         yield
+        prewarm.cancel()
         sweeper.cancel()
         await coordinator.shutdown()
 
@@ -504,19 +511,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def agent_catalog():
         return {
             "default_provider": resolved_settings.default_provider,
-            "providers": providers.catalog(),
+            "providers": await providers.catalog(),
         }
 
     @app.get("/api/models", dependencies=[Depends(require_auth)])
     async def get_models(provider: str | None = None):
         provider_id = provider or resolved_settings.default_provider
+        # One refresh covers both lists below, and it is the only await here:
+        # everything after it reads warm caches.
+        catalog = await providers.catalog()
         selected = providers.get(provider_id)
         return {
             "provider": provider_id,
             # Ids paired with the provider's own display names, so adding a
             # model never requires a matching client release.
             "models": selected.model_catalog(),
-            "providers": providers.catalog(),
+            "providers": catalog,
         }
 
     @app.get("/api/workspace-roots", dependencies=[Depends(require_auth)])
@@ -527,7 +537,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/conversations", dependencies=[Depends(require_auth)])
-    async def list_conversations(include_archived: bool = False):
+    def list_conversations(include_archived: bool = False):
         return [
             asdict(item)
             for item in database.list_conversations(include_archived=include_archived)
@@ -538,7 +548,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         status_code=status.HTTP_201_CREATED,
         dependencies=[Depends(require_auth)],
     )
-    async def create_conversation(request: ConversationCreate):
+    def create_conversation(request: ConversationCreate):
         name = request.name.strip()
         if not name:
             raise HTTPException(status_code=422, detail="Conversation name is required")
@@ -566,7 +576,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}",
         dependencies=[Depends(require_auth)],
     )
-    async def update_conversation(conversation_id: int, request: ConversationUpdate):
+    def update_conversation(conversation_id: int, request: ConversationUpdate):
         if coordinator.is_running(conversation_id) and (
             request.path is not None
             or request.provider is not None
@@ -619,7 +629,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def delete_conversation(conversation_id: int):
         await coordinator.cancel(conversation_id)
-        deleted = database.delete_conversation(conversation_id)
+        deleted = await asyncio.to_thread(database.delete_conversation, conversation_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return {"status": "ok"}
@@ -628,7 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/history/{conversation_id}",
         dependencies=[Depends(require_auth)],
     )
-    async def get_history(conversation_id: int):
+    def get_history(conversation_id: int):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return [asdict(item) for item in database.list_messages(conversation_id)]
@@ -638,7 +648,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_auth)],
     )
     async def clear_history(conversation_id: int):
-        if database.get_conversation(conversation_id) is None:
+        if await asyncio.to_thread(database.get_conversation, conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         await coordinator.clear_history(conversation_id)
         return {"status": "ok"}
@@ -647,7 +657,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/messages/{message_id}/feedback",
         dependencies=[Depends(require_auth)],
     )
-    async def set_message_feedback(
+    def set_message_feedback(
         conversation_id: int, message_id: int, request: MessageFeedbackUpdate
     ):
         message = database.set_message_feedback(
@@ -662,7 +672,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_auth)],
     )
     async def summarize_conversation(conversation_id: int):
-        conversation = database.get_conversation(conversation_id)
+        conversation = await asyncio.to_thread(database.get_conversation, conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         try:
@@ -681,7 +691,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/summaries",
         dependencies=[Depends(require_auth)],
     )
-    async def list_summaries(conversation_id: int):
+    def list_summaries(conversation_id: int):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return database.list_summary_checkpoints(conversation_id)
@@ -690,7 +700,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/summaries/{summary_id}",
         dependencies=[Depends(require_auth)],
     )
-    async def update_summary(
+    def update_summary(
         conversation_id: int, summary_id: int, request: SummaryUpdate
     ):
         if coordinator.is_running(conversation_id):
@@ -717,7 +727,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         status_code=status.HTTP_201_CREATED,
         dependencies=[Depends(require_auth)],
     )
-    async def create_share(conversation_id: int, request: ShareCreate):
+    def create_share(conversation_id: int, request: ShareCreate):
         conversation = database.get_conversation(conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -765,7 +775,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/shares",
         dependencies=[Depends(require_auth)],
     )
-    async def list_shares(conversation_id: int):
+    def list_shares(conversation_id: int):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         shares = [
@@ -779,13 +789,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/shares/{share_id}",
         dependencies=[Depends(require_auth)],
     )
-    async def revoke_share(conversation_id: int, share_id: int):
+    def revoke_share(conversation_id: int, share_id: int):
         if not database.delete_share(conversation_id, share_id):
             raise HTTPException(status_code=404, detail="Share link not found")
         return {"status": "revoked"}
 
     @app.get(SHARE_API_PREFIX + "{token}")
-    async def read_shared_conversation(token: str, request: Request):
+    def read_shared_conversation(token: str, request: Request):
         """The one unauthenticated read in the application.
 
         The token is the entire credential, so this route stays a dead end for
@@ -819,7 +829,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/search", dependencies=[Depends(require_auth)])
-    async def search(
+    def search(
         q: str = Query(min_length=1, max_length=256),
         limit: int = Query(default=50, ge=1, le=100),
     ):
@@ -836,7 +846,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/tasks",
         dependencies=[Depends(require_auth)],
     )
-    async def conversation_tasks(conversation_id: int):
+    def conversation_tasks(conversation_id: int):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return {
@@ -889,7 +899,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/conversations/{conversation_id}/stats",
         dependencies=[Depends(require_auth)],
     )
-    async def conversation_stats(conversation_id: int):
+    def conversation_stats(conversation_id: int):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return {
@@ -902,7 +912,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_auth)],
     )
     async def workspace_status(conversation_id: int):
-        conversation = database.get_conversation(conversation_id)
+        conversation = await asyncio.to_thread(database.get_conversation, conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         try:
@@ -912,7 +922,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await asyncio.to_thread(_workspace_git_status, workspace)
 
     @app.get("/api/ls", dependencies=[Depends(require_auth)])
-    async def list_directory(
+    def list_directory(
         path: str | None = Query(default=None, min_length=1, max_length=4096),
         show_hidden: bool = False,
     ):
@@ -956,7 +966,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         q: str = Query(default="", max_length=256),
         limit: int = Query(default=50, ge=1, le=100),
     ):
-        conversation = database.get_conversation(conversation_id)
+        conversation = await asyncio.to_thread(database.get_conversation, conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         try:
@@ -987,7 +997,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not await authenticate_websocket(websocket, config.get("token")):
                 return
             conversation_id = int(config.get("conversation_id"))
-            conversation = database.get_conversation(conversation_id)
+            conversation = await asyncio.to_thread(
+                database.get_conversation, conversation_id
+            )
             if conversation is None:
                 await websocket.send_json(
                     {
@@ -1028,7 +1040,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
                 try:
                     chat_message = ChatMessage.model_validate(raw_message)
-                    latest_conversation = database.get_conversation(conversation_id)
+                    latest_conversation = await asyncio.to_thread(
+                        database.get_conversation, conversation_id
+                    )
                     if latest_conversation is None:
                         raise ValueError("Conversation not found")
                     submitted = await coordinator.submit(

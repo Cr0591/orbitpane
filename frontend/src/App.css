@@ -1434,6 +1434,25 @@
   flex-direction: column;
   width: 100%;
   gap: var(--space-2);
+  /* A long transcript is hundreds of rows of parsed markdown, highlighted code
+     and typeset maths. Rendering work for the ones nobody is looking at is what
+     made scrolling a long conversation stutter, so the browser is told it may
+     skip style, layout and paint for rows outside the viewport.
+
+     `auto` on the intrinsic size is what makes this safe here: once a row has
+     been rendered the browser remembers its real height and keeps using it
+     while the row is skipped, so the scrollbar stays honest and scrolling to
+     the bottom still lands at the bottom. The 220px is only the guess for rows
+     that have never been on screen. Browsers without support simply render
+     everything, as before. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
+}
+
+/* Exporting the transcript as an image draws rows that are far outside the
+   viewport, which is exactly what the rule above declines to render. */
+.exporting-conversation .message-row {
+  content-visibility: visible;
 }
 
 .message-row.user {

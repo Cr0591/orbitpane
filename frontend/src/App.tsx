@@ -4,6 +4,7 @@ import { useConversations } from './hooks/useConversations'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useToasts } from './hooks/useToasts'
 import { useDrawerGesture } from './hooks/useDrawerGesture'
+import { useEventCallback } from './hooks/useEventCallback'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ArrowDown, WifiOff, RefreshCw } from 'lucide-react'
 import './App.css'
@@ -173,7 +174,7 @@ export default function App() {
     loadHistory,
     connectWebSocket,
     disconnectCurrentSocket,
-  } = useWebSocket(activeConv, showToast, loadConversations, scrollToBottom)
+  } = useWebSocket(activeConvRef, showToast, loadConversations, scrollToBottom)
 
   // Drawer state
   const isDesktopRef = useRef(window.innerWidth >= 1024)
@@ -487,25 +488,39 @@ export default function App() {
     }
   }, [isNearBottom, scrollToBottom])
 
-  // Initial data load when logged in
+  /**
+   * Boot the workspace once per session.
+   *
+   * This is a reaction to signing in, not to its own dependencies. Several of
+   * the loaders below are rebuilt when `/api/agents` reports a default
+   * provider, so listing them re-ran the whole sequence a second time — a
+   * duplicate history fetch, a second socket for the same project, and the
+   * sidebar dropping back to its skeleton after it had already filled in.
+   */
+  const bootstrappedRef = useRef(false)
   useEffect(() => {
-    if (isLoggedIn) {
-      loadConversations(true)?.then((conv: Conversation | null) => {
-        if (conv) {
-          loadHistory(conv.id)?.then(msgs => {
-            if (msgs) {
-              const last = [...msgs].reverse().find(m => m.model)
-              if (conv.preferred_model) setSelectedModel(conv.preferred_model)
-              else if (last?.model) setSelectedModel(last.model)
-            }
-          })
-          connectWebSocket(conv, false)
-        }
-      })
-      loadProviders()
-      loadModels()
-      loadWorkspaceRoots()
+    if (!isLoggedIn) {
+      bootstrappedRef.current = false
+      return
     }
+    if (bootstrappedRef.current) return
+    bootstrappedRef.current = true
+
+    loadConversations(true)?.then((conv: Conversation | null) => {
+      if (conv) {
+        loadHistory(conv.id)?.then(msgs => {
+          if (msgs) {
+            const last = msgs.findLast(m => m.model)
+            if (conv.preferred_model) setSelectedModel(conv.preferred_model)
+            else if (last?.model) setSelectedModel(last.model)
+          }
+        })
+        connectWebSocket(conv, false)
+      }
+    })
+    loadProviders()
+    loadModels()
+    loadWorkspaceRoots()
   }, [isLoggedIn, loadConversations, loadProviders, loadModels, loadWorkspaceRoots, loadHistory, connectWebSocket, setSelectedModel])
 
   useEffect(() => {
@@ -709,7 +724,7 @@ export default function App() {
 
     loadHistory(conv.id)?.then(msgs => {
       if (msgs) {
-        const last = [...msgs].reverse().find(m => m.model)
+        const last = msgs.findLast(m => m.model)
         if (conv.preferred_model) setSelectedModel(conv.preferred_model)
         else if (last?.model) setSelectedModel(last.model)
         window.requestAnimationFrame(() => {
@@ -978,6 +993,9 @@ export default function App() {
     if (!activeConv || !targetElement || !hasConversationMessages || isExporting) return
 
     setIsExporting(true)
+    // Off-screen rows are normally left unrendered for scrolling performance;
+    // an export has to draw the whole transcript, most of which is off-screen.
+    document.documentElement.classList.add('exporting-conversation')
     const modifiedElements: Array<{ el: HTMLElement; style: string | null }> = []
 
     const setTempStyle = (el: HTMLElement, styles: Partial<CSSStyleDeclaration>) => {
@@ -1113,6 +1131,7 @@ export default function App() {
       showToast('导出图片失败，请重试')
     } finally {
       setIsExporting(false)
+      document.documentElement.classList.remove('exporting-conversation')
       // Cleanly restore all original inline styles
       for (let i = modifiedElements.length - 1; i >= 0; i--) {
         const { el, style } = modifiedElements[i]
@@ -1160,8 +1179,10 @@ export default function App() {
     })
   }, [activeConvRef, setMessages, showToast])
 
-  const regenerateLastResponse = () => {
-    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+  /* Stable identity: this reaches every row of a memoised transcript, so a
+     fresh closure per render would re-render the whole conversation. */
+  const regenerateLastResponse = useEventCallback(() => {
+    const lastUserMsg = messages.findLast(m => m.role === 'user')
     if (!lastUserMsg) return
 
     if (!isConnected && activeConvRef.current) {
@@ -1176,7 +1197,7 @@ export default function App() {
     } else {
       showToast('无法重新生成，请检查连接状态', 'error')
     }
-  }
+  })
 
   const handleLogin = () => {
     setIsLoggedIn(true)

@@ -406,7 +406,17 @@ export function mergeHistoryWithTransientMessages(
 }
 
 export function useWebSocket(
-  activeConv: Conversation | null,
+  /**
+   * The live conversation, shared with `useConversations` rather than mirrored.
+   *
+   * A private copy synced from a `useEffect` lagged the state it tracked by a
+   * commit, and every guard in here reads it to decide whether a reply still
+   * belongs to the open project. Selecting a project assigns the ref and calls
+   * `loadHistory` in the same tick, so a mirror could still be pointing at the
+   * previous project when the response arrived, and drop a transcript the user
+   * was looking at.
+   */
+  activeConvRef: React.MutableRefObject<Conversation | null>,
   showToast: (msg: string) => void,
   loadConversations: (isInitial?: boolean) => void,
   scrollToBottom: (smooth?: boolean) => void
@@ -417,21 +427,41 @@ export function useWebSocket(
   const [isReconnecting, setIsReconnecting] = useState(false)
   const socketRef = useRef<WebSocket | null>(null)
   const socketConversationIdRef = useRef<number | null>(null)
-  const activeConvRef = useRef<Conversation | null>(activeConv)
   const isAgentThinkingRef = useRef<boolean>(false)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastPongRef = useRef(Date.now())
   const reconnectAttemptRef = useRef<number>(0)
   const historyRequestRef = useRef(0)
+  /**
+   * How many history loads are in flight.
+   *
+   * The skeleton comes down when this reaches zero, rather than on the success
+   * path of one particular request. A reply that lost its race used to return
+   * early with the flag still raised, and the request that supersedes it is
+   * usually a silent background refresh that never lowers it — so a cold start
+   * whose first load raced the socket's own `ready` refresh kept its skeleton
+   * up until the user switched projects.
+   */
+  const historyInFlightRef = useRef(0)
+  /**
+   * Stream events waiting to be folded into `messages`, with the conversation
+   * each one belongs to.
+   *
+   * An agent emits tokens far faster than a screen refreshes, and every one of
+   * them used to commit its own render of the whole transcript. On a long
+   * conversation that is where the stutter came from: the work is proportional
+   * to the messages already on screen, not to the token that arrived. Folding a
+   * frame's worth of events into a single update makes the cost of streaming
+   * independent of how fast the agent is talking, and no update is ever skipped
+   * — they are applied in order, just together.
+   */
+  const streamBufferRef = useRef<Array<{ conversationId: number; event: RealtimeEvent }>>([])
+  const streamFrameRef = useRef<number | null>(null)
   const pendingSendMessagesRef = useRef(new Map<
     number,
     Array<{ content: string; model: string; provider: string }>
   >())
-
-  useEffect(() => {
-    activeConvRef.current = activeConv
-  }, [activeConv])
 
   const isAgentThinking = messages.some(message => (
     message.role === 'agent' && message.isThinking
@@ -439,6 +469,51 @@ export function useWebSocket(
   useEffect(() => {
     isAgentThinkingRef.current = isAgentThinking
   }, [isAgentThinking])
+
+  const clearStreamBuffer = useCallback(() => {
+    streamBufferRef.current = []
+    if (streamFrameRef.current !== null) {
+      cancelAnimationFrame(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+  }, [])
+
+  const flushStreamBuffer = useCallback(() => {
+    if (streamFrameRef.current !== null) {
+      cancelAnimationFrame(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+    const queued = streamBufferRef.current
+    if (queued.length === 0) return
+    streamBufferRef.current = []
+    setMessages(previous => {
+      const conversationId = activeConvRef.current?.id
+      let next = previous
+      for (const entry of queued) {
+        // Re-checked here rather than on arrival: the reader can move to
+        // another project between an event being queued and the frame landing.
+        if (entry.conversationId !== conversationId) continue
+        next = applyRealtimeEvent(next, entry.event)
+      }
+      if (next === previous) return previous
+      isAgentThinkingRef.current = next.some(message => (
+        message.role === 'agent' && message.isThinking
+      ))
+      return next
+    })
+  }, [activeConvRef])
+
+  const queueStreamEvent = useCallback((conversationId: number, event: RealtimeEvent) => {
+    streamBufferRef.current.push({ conversationId, event })
+    if (streamFrameRef.current === null) {
+      streamFrameRef.current = requestAnimationFrame(() => {
+        streamFrameRef.current = null
+        flushStreamBuffer()
+      })
+    }
+  }, [flushStreamBuffer])
+
+  useEffect(() => clearStreamBuffer, [clearStreamBuffer])
 
   const disconnectCurrentSocket = useCallback(() => {
     if (reconnectTimerRef.current) {
@@ -449,6 +524,7 @@ export function useWebSocket(
       clearInterval(heartbeatTimerRef.current)
       heartbeatTimerRef.current = null
     }
+    clearStreamBuffer()
     const currentSocket = socketRef.current
     socketRef.current = null
     socketConversationIdRef.current = null
@@ -461,18 +537,25 @@ export function useWebSocket(
     }
     setIsConnected(false)
     setIsReconnecting(false)
-  }, [])
+  }, [clearStreamBuffer])
 
   const loadHistory = useCallback((convId: number, silent = false) => {
     if (!silent) setIsHistoryLoading(true)
     const requestId = ++historyRequestRef.current
+    historyInFlightRef.current += 1
+    const settle = () => {
+      historyInFlightRef.current -= 1
+      if (historyInFlightRef.current === 0) setIsHistoryLoading(false)
+    }
+    /** Whether this reply still describes what the reader is looking at. */
+    const isCurrent = () => (
+      requestId === historyRequestRef.current
+      && activeConvRef.current?.id === convId
+    )
     return apiFetch<Message[]>(`/api/history/${convId}`)
       .then(data => {
-        if (
-          requestId !== historyRequestRef.current
-          || activeConvRef.current?.id !== convId
-        ) return null
-        if (!silent) setIsHistoryLoading(false)
+        settle()
+        if (!isCurrent()) return null
         // Normalized before it is cached, so a bad row cannot be replayed from
         // localStorage on every later load either.
         const history = normalizeMessages(data)
@@ -491,11 +574,8 @@ export function useWebSocket(
       })
       .catch(err => {
         console.error(err)
-        if (
-          requestId === historyRequestRef.current
-          && activeConvRef.current?.id === convId
-        ) {
-          if (!silent) setIsHistoryLoading(false)
+        settle()
+        if (isCurrent()) {
           const cached = normalizeMessages(readCachedHistory<unknown>(convId, []))
           setMessages(current => {
             const merged = mergeHistoryWithTransientMessages(cached, current)
@@ -507,7 +587,7 @@ export function useWebSocket(
         }
         return null
       })
-  }, [scrollToBottom])
+  }, [activeConvRef, scrollToBottom])
 
   const connectWebSocket = useCallback((conv: Conversation, isManual = false) => {
     if (reconnectTimerRef.current) {
@@ -628,7 +708,9 @@ export function useWebSocket(
 
         if (data.type === 'history_cleared') {
           // The server dropped messages, summaries and the whole queue, so no
-          // transient turn may survive here either.
+          // transient turn may survive here either — including tokens still
+          // sitting in the frame buffer.
+          clearStreamBuffer()
           historyRequestRef.current += 1
           isAgentThinkingRef.current = false
           awaitingPendingStart = false
@@ -662,14 +744,18 @@ export function useWebSocket(
           || data.type === 'done'
         ) {
           if (data.type === 'start') awaitingPendingStart = false
-          setMessages(previous => {
-            if (activeConvRef.current?.id !== conv.id) return previous
-            const updated = applyRealtimeEvent(previous, data)
-            isAgentThinkingRef.current = updated.some(message => (
-              message.role === 'agent' && message.isThinking
-            ))
-            return updated
-          })
+          queueStreamEvent(conv.id, data)
+          // A turn beginning or ending changes what the whole screen shows —
+          // the thinking indicator, the toolbar, the composer — so it lands
+          // now rather than on the next frame. Draining the buffer through the
+          // same path keeps every event in the order it arrived.
+          if (
+            data.type === 'start'
+            || data.type === 'sync_state'
+            || data.type === 'done'
+          ) {
+            flushStreamBuffer()
+          }
           if (data.type === 'done') {
             loadConversations(false)
             loadHistory(conv.id, true)
@@ -763,7 +849,16 @@ export function useWebSocket(
         }
       }, delay)
     }
-  }, [disconnectCurrentSocket, loadConversations, loadHistory, showToast])
+  }, [
+    activeConvRef,
+    clearStreamBuffer,
+    disconnectCurrentSocket,
+    flushStreamBuffer,
+    loadConversations,
+    loadHistory,
+    queueStreamEvent,
+    showToast,
+  ])
 
   return {
     messages,

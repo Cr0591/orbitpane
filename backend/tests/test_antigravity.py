@@ -60,45 +60,6 @@ class AntigravityModelCatalogTests(TestCase):
             timeout=10,
         )
 
-    def test_provider_caches_cli_models(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            provider = AntigravityProvider(test_settings(Path(temp_dir)))
-            with (
-                patch.dict("os.environ", {}, clear=True),
-                patch(
-                    "backend.app.agents.antigravity.fetch_antigravity_models",
-                    return_value=(("live-model", "Live Model"),),
-                ) as fetch_mock,
-            ):
-                self.assertEqual(provider.models, ("live-model",))
-                self.assertEqual(provider.models, ("live-model",))
-                self.assertEqual(
-                    provider.model_catalog(),
-                    [{"id": "live-model", "display_name": "Live Model"}],
-                )
-
-        fetch_mock.assert_called_once_with("true")
-
-    def test_provider_refreshes_models_after_ttl(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            provider = AntigravityProvider(test_settings(Path(temp_dir)))
-            provider._CACHE_TTL_SECONDS = 10
-            with (
-                patch.dict("os.environ", {}, clear=True),
-                patch(
-                    "backend.app.agents.antigravity.fetch_antigravity_models",
-                    side_effect=[
-                        (("model-v1", "Model V1"),),
-                        (("model-v2", "Model V2"),),
-                    ],
-                ) as fetch_mock,
-                patch("time.monotonic", side_effect=[100.0, 105.0, 120.0]),
-            ):
-                self.assertEqual(provider.models, ("model-v1",))
-                self.assertEqual(provider.models, ("model-v1",))
-                self.assertEqual(provider.models, ("model-v2",))
-                self.assertEqual(fetch_mock.call_count, 2)
-
     def test_model_catalog_falls_back_to_humanized_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = AntigravityProvider(test_settings(Path(temp_dir)))
@@ -304,3 +265,97 @@ class AntigravityProviderTests(IsolatedAsyncioTestCase):
                 ["Recovered final answer"],
             )
             terminate_mock.assert_awaited_once_with(process)
+
+
+class AntigravityModelRefreshTests(IsolatedAsyncioTestCase):
+    """The model list is discovered off the event loop, and only once."""
+
+    async def test_reading_models_never_probes_the_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AntigravityProvider(test_settings(Path(temp_dir)))
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                ) as fetch_mock,
+            ):
+                # Until a refresh lands, the configured list stands in — and
+                # reading it must not shell out, because every read happens on
+                # the event loop while requests are in flight.
+                self.assertEqual(provider.models, ("test-model",))
+                self.assertEqual(provider.model_display_name("test-model"), "Test Model")
+                fetch_mock.assert_not_called()
+
+    async def test_refresh_populates_the_catalog_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AntigravityProvider(test_settings(Path(temp_dir)))
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    return_value=(("live-model", "Live Model"),),
+                ) as fetch_mock,
+            ):
+                await provider.ensure_model_catalog()
+                await provider.ensure_model_catalog()
+                self.assertEqual(provider.models, ("live-model",))
+                self.assertEqual(
+                    provider.model_catalog(),
+                    [{"id": "live-model", "display_name": "Live Model"}],
+                )
+
+        fetch_mock.assert_called_once_with("true")
+
+    async def test_concurrent_refreshes_share_one_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AntigravityProvider(test_settings(Path(temp_dir)))
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    return_value=(("live-model", "Live Model"),),
+                ) as fetch_mock,
+            ):
+                await asyncio.gather(*(provider.ensure_model_catalog() for _ in range(5)))
+
+        self.assertEqual(fetch_mock.call_count, 1)
+
+    async def test_stale_catalog_is_served_while_it_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AntigravityProvider(test_settings(Path(temp_dir)))
+            provider._catalog._ttl_seconds = 0
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    side_effect=[
+                        (("model-v1", "Model V1"),),
+                        (("model-v2", "Model V2"),),
+                    ],
+                ),
+            ):
+                await provider.ensure_model_catalog()
+                self.assertEqual(provider.models, ("model-v1",))
+
+                # Stale now, so this returns immediately with the old list and
+                # replaces it in the background — no request ever waits.
+                await provider.ensure_model_catalog()
+                self.assertEqual(provider.models, ("model-v1",))
+                await provider._catalog._refresh_task
+                self.assertEqual(provider.models, ("model-v2",))
+
+    async def test_failed_probe_keeps_the_previous_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = AntigravityProvider(test_settings(Path(temp_dir)))
+            provider._catalog._ttl_seconds = 0
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    side_effect=[(("model-v1", "Model V1"),), ()],
+                ),
+            ):
+                await provider.ensure_model_catalog()
+                await provider.ensure_model_catalog()
+                await provider._catalog._refresh_task
+                self.assertEqual(provider.models, ("model-v1",))

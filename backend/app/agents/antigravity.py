@@ -19,6 +19,8 @@ from .base import (
     AgentRequest,
     AgentResult,
     EmitEvent,
+    ModelCatalog,
+    ModelCatalogCache,
     ProviderError,
     empty_output_error,
     humanize_model_id,
@@ -28,7 +30,7 @@ from .process import terminate_process
 logger = logging.getLogger(__name__)
 
 
-def fetch_antigravity_models(command: str = "agy") -> tuple[tuple[str, str], ...]:
+def fetch_antigravity_models(command: str = "agy") -> ModelCatalog:
     """Read the (model id, display name) pairs exposed by the Antigravity CLI."""
     try:
         result = subprocess.run(
@@ -65,7 +67,6 @@ class AntigravityProvider(AgentProvider):
     display_name = "Google Gemini"
     tone = "gemini"
     _COMPLETION_GRACE_SECONDS = 30
-    _CACHE_TTL_SECONDS = 300
 
     CLI_MODEL_ALIASES = {
         "gemini-3.1-pro-high": "gemini-3.1-pro-low",
@@ -75,35 +76,24 @@ class AntigravityProvider(AgentProvider):
         self.settings = settings
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._interrupted: set[int] = set()
-        self._cached_models: tuple[str, ...] | None = None
-        self._cached_at: float = 0
-        self._model_labels: dict[str, str] = {}
+        self._catalog = ModelCatalogCache(
+            self.id,
+            # `agy models` reaches the network, so it only ever runs in a
+            # worker thread; until the first probe lands the configured list
+            # stands in for it.
+            fetch=lambda: fetch_antigravity_models(self.settings.antigravity_command),
+            fallback=lambda: self.settings.antigravity_models,
+        )
 
     @property
     def models(self) -> tuple[str, ...]:
-        now = time.monotonic()
-        if (
-            self._cached_models is None
-            or (now - self._cached_at) > self._CACHE_TTL_SECONDS
-        ):
-            fetched = fetch_antigravity_models(self.settings.antigravity_command)
-            if fetched:
-                self._model_labels = {model: label for model, label in fetched}
-                self._cached_models = tuple(model for model, _ in fetched)
-                self._cached_at = now
-            elif self._cached_models is None:
-                # Fallback to environment variable if agy models fetch fails
-                self._cached_models = self.settings.antigravity_models
-                self._cached_at = now
-            else:
-                self._cached_at = now
-        return self._cached_models
+        return self._catalog.models
+
+    async def ensure_model_catalog(self) -> None:
+        await self._catalog.ensure_fresh()
 
     def model_display_name(self, model: str) -> str:
-        # Populate the label cache on first access if models were never read.
-        if not self._model_labels:
-            _ = self.models
-        return self._model_labels.get(model) or humanize_model_id(model)
+        return self._catalog.display_name(model)
 
     @property
     def available(self) -> bool:

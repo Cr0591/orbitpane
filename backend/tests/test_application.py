@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
+import time
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
 
 import httpx
 
@@ -41,6 +44,55 @@ class ApplicationTests(IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("orbitpane_session", response.cookies)
         return {}
+
+    async def test_slow_model_discovery_does_not_stall_the_event_loop(self) -> None:
+        """A cold start must not hang behind the agent CLI.
+
+        `/api/models` shells out to discover models, and the client fires it
+        alongside the requests that fill the conversation list and the
+        transcript. When that probe ran on the event loop it froze the whole
+        server for as long as the CLI took — seconds, in production — and those
+        siblings timed out with their skeletons still on screen.
+
+        So the assertion is on the event loop itself: a heartbeat running
+        alongside the request must keep its cadence.
+        """
+        headers = await self.login_headers()
+        probe_seconds = 0.4
+
+        def slow_probe(_command: str) -> tuple[tuple[str, str], ...]:
+            time.sleep(probe_seconds)
+            return (("live-model", "Live Model"),)
+
+        worst_lag = 0.0
+
+        async def heartbeat() -> None:
+            nonlocal worst_lag
+            while True:
+                tick = time.monotonic()
+                await asyncio.sleep(0.01)
+                worst_lag = max(worst_lag, time.monotonic() - tick - 0.01)
+
+        # Empty the caches the way an expired TTL does, so the request has to
+        # discover models rather than read what prewarm left behind.
+        for provider in self.app.state.providers._providers.values():
+            provider._catalog._models = None
+
+        with patch(
+            "backend.app.agents.antigravity.fetch_antigravity_models",
+            side_effect=slow_probe,
+        ):
+            pulse = asyncio.create_task(heartbeat())
+            try:
+                response = await self.client.get("/api/models", headers=headers)
+            finally:
+                pulse.cancel()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [model["id"] for model in response.json()["models"]], ["live-model"]
+        )
+        self.assertLess(worst_lag, probe_seconds / 2)
 
     async def test_protected_routes_require_authentication(self) -> None:
         response = await self.client.get("/api/conversations")

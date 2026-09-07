@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -146,6 +148,116 @@ def empty_output_error(
     )
 
 
+#: How long a discovered model list is trusted before a refresh is scheduled.
+MODEL_CACHE_TTL_SECONDS = 300
+
+#: (model id, display name) pairs, as published by an agent CLI.
+ModelCatalog = tuple[tuple[str, str], ...]
+
+
+class ModelCatalogCache:
+    """A provider's model list, refreshed without ever blocking the event loop.
+
+    Discovery shells out to the agent CLI, which talks to the network: `agy
+    models` takes seconds even when everything is healthy. Running that probe
+    synchronously inside an `async def` route froze the whole server — a cold
+    start fires `/api/agents`, `/api/models`, `/api/conversations` and
+    `/api/history` together, and the three that needed no CLI at all sat behind
+    the one that did, long enough for the client to abort them and leave its
+    skeletons up.
+
+    So the request path only ever reads a snapshot, and refreshing is an
+    awaitable that runs the probe in a worker thread. A stale list is served
+    while a single background refresh replaces it, which means only the very
+    first read after a restart can wait at all — and `prewarm` usually spends
+    even that before a client connects.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        fetch: Callable[[], ModelCatalog],
+        fallback: Callable[[], tuple[str, ...]],
+        ttl_seconds: float = MODEL_CACHE_TTL_SECONDS,
+    ) -> None:
+        self._label = label
+        self._fetch = fetch
+        self._fallback = fallback
+        self._ttl_seconds = ttl_seconds
+        self._models: tuple[str, ...] | None = None
+        self._labels: dict[str, str] = {}
+        self._fetched_at = 0.0
+        self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """The cached ids, or the configured fallback until a probe lands."""
+        return self._models if self._models is not None else self._fallback()
+
+    def display_name(self, model: str) -> str:
+        return self._labels.get(model) or humanize_model_id(model)
+
+    @property
+    def has_probed(self) -> bool:
+        """Whether a discovery attempt has completed at least once."""
+        return self._models is not None
+
+    @property
+    def is_stale(self) -> bool:
+        return (
+            self._models is None
+            or (time.monotonic() - self._fetched_at) > self._ttl_seconds
+        )
+
+    async def ensure_fresh(self) -> None:
+        """Bring the cache up to date without stalling this request.
+
+        Only a cache that has never been filled makes the caller wait, and even
+        then it waits on a worker thread rather than on the event loop.
+        """
+        if not self.is_stale:
+            return
+        if self._models is None:
+            await self._refresh()
+            return
+        self._schedule_refresh()
+
+    def _schedule_refresh(self) -> None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        try:
+            self._refresh_task = asyncio.create_task(self._refresh())
+        except RuntimeError:
+            # No running loop (a synchronous caller outside the app). The stale
+            # entry stands; the next request inside the loop refreshes it.
+            pass
+
+    async def _refresh(self) -> None:
+        # Single-flight: concurrent callers queue on the lock and the second
+        # one finds the cache fresh, so one probe serves them all.
+        async with self._lock:
+            if not self.is_stale:
+                return
+            try:
+                fetched = await asyncio.to_thread(self._fetch)
+            except Exception:
+                logger.exception("Model discovery failed for %s", self._label)
+                fetched = ()
+            self._apply(fetched)
+
+    def _apply(self, fetched: ModelCatalog) -> None:
+        if fetched:
+            self._labels = {model: label for model, label in fetched}
+            self._models = tuple(model for model, _ in fetched)
+        elif self._models is None:
+            self._models = self._fallback()
+        # A failed probe keeps whatever was already being served rather than
+        # emptying the model picker. The timestamp still moves, so a CLI that
+        # is down is not re-probed on every single request.
+        self._fetched_at = time.monotonic()
+
+
 class AgentProvider(ABC):
     id: str
     display_name: str
@@ -155,7 +267,16 @@ class AgentProvider(ABC):
     @property
     @abstractmethod
     def models(self) -> tuple[str, ...]:
+        """The model ids on offer, read from cache — never a blocking probe."""
         raise NotImplementedError
+
+    async def ensure_model_catalog(self) -> None:
+        """Refresh `models` if it has gone stale, off the event loop.
+
+        Providers whose list comes from a CLI override this; a provider with a
+        static list has nothing to refresh.
+        """
+        return None
 
     def model_display_name(self, model: str) -> str:
         """Label shown for a model id.
