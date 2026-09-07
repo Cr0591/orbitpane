@@ -20,6 +20,7 @@ from .base import (
     AgentResult,
     EmitEvent,
     ProviderError,
+    empty_output_error,
     humanize_model_id,
 )
 from .process import terminate_process
@@ -265,9 +266,13 @@ class AntigravityProvider(AgentProvider):
                 final_content = completed_responses[-1]
                 await emit(AgentEvent("token", final_content))
             if not final_content.strip() and not interrupted:
-                raise ProviderError(
-                    "Antigravity completed without generating text content. "
-                    "This usually occurs when a requested tool operation requires permissions or failed to complete."
+                # Exit code 0 with nothing on stdout: the reason is on stderr
+                # and nowhere else, so it has to be read here rather than
+                # guessed at from the empty result.
+                raise empty_output_error(
+                    "Antigravity",
+                    "".join(stderr_lines),
+                    request.permission_mode,
                 )
 
             return AgentResult(

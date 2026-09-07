@@ -40,6 +40,15 @@ export interface Message {
   duration?: number
   elapsedSoFar?: number
   isError?: boolean
+  /**
+   * Server-assigned class of failure, e.g. `permission_required`.
+   *
+   * Keyed on rather than the provider id so the client can offer the right
+   * remedy without learning which agent produced the error.
+   */
+  errorCode?: string
+  /** Verbatim agent output behind the failure, folded away until asked for. */
+  errorDetail?: string
   timestamp?: string
   model?: string
   provider?: string

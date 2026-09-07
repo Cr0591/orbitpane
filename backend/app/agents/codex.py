@@ -15,6 +15,7 @@ from .base import (
     AgentResult,
     EmitEvent,
     ProviderError,
+    empty_output_error,
     humanize_model_id,
 )
 from .process import terminate_process
@@ -215,9 +216,7 @@ class CodexCliProvider(AgentProvider):
                     + (f": {stderr[-4000:]}" if stderr else "")
                 )
             if not final_content.strip() and not interrupted:
-                raise ProviderError(
-                    "Codex completed without generating text content."
-                )
+                raise empty_output_error("Codex", stderr, request.permission_mode)
 
             return AgentResult(
                 content=final_content,

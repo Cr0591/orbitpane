@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from unittest import IsolatedAsyncioTestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 
 from backend.app.agents.base import (
     AgentEvent,
@@ -319,3 +319,33 @@ class AgentCoordinatorTests(IsolatedAsyncioTestCase):
             event_count = len(hub.messages)
             await asyncio.sleep(0.03)
             self.assertEqual(len(hub.messages), event_count)
+
+
+class AugmentPromptTests(TestCase):
+    def test_unrestricted_projects_are_pointed_at_their_guideline_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "README.md").write_text("hello", encoding="utf-8")
+
+            prompt = AgentCoordinator._augment_prompt(temp_dir, "hi", "unrestricted")
+
+            self.assertIn("README.md", prompt)
+            self.assertTrue(prompt.endswith("hi"))
+
+    def test_restricted_projects_are_not_told_to_read_anything(self) -> None:
+        """The note forces a tool call that a sandboxed print-mode run cannot
+        get approved, which turned every prompt in the project into an empty
+        answer. Leave the decision to the agent when permissions are limited."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "README.md").write_text("hello", encoding="utf-8")
+
+            self.assertEqual(
+                AgentCoordinator._augment_prompt(temp_dir, "hi", "workspace"),
+                "hi",
+            )
+
+    def test_workspace_without_guideline_files_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertEqual(
+                AgentCoordinator._augment_prompt(temp_dir, "hi", "unrestricted"),
+                "hi",
+            )

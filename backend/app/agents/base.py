@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..models import Message
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +94,56 @@ def humanize_model_id(model: str) -> str:
 
 
 class ProviderError(RuntimeError):
-    pass
+    """A failure worth explaining to the person who sent the prompt.
+
+    `code` classifies the failure without naming the adapter that raised it, so
+    the transport and the client can react to a *kind* of problem — a denied
+    permission, say — without growing provider conditionals. `detail` holds raw
+    CLI output, kept apart from the sentence addressed to the user so a client
+    can fold it away; `str(exc)` still carries both, since the task list and the
+    logs only ever see the one string.
+    """
+
+    def __init__(
+        self, message: str, *, code: str = "provider_error", detail: str = ""
+    ) -> None:
+        super().__init__(f"{message}（CLI 输出：{detail}）" if detail else message)
+        self.code = code
+        #: The part written for the user, without the transcript.
+        self.summary = message
+        #: Verbatim provider output, or empty when there was none.
+        self.detail = detail
+
+
+def empty_output_error(
+    provider_label: str, detail: str, permission_mode: str
+) -> ProviderError:
+    """Explain a run that ended successfully without printing an answer.
+
+    Both CLIs exit 0 in this case and put the reason on stderr, and by far the
+    most common reason is a tool needing a permission that print mode cannot
+    prompt for — a project setting, not a fault. That line is the only thing
+    separating it from a genuine failure, so it is carried into the message
+    rather than replaced with a guess about what went wrong.
+    """
+    # The tail carries the CLI's closing diagnosis; anything earlier is
+    # progress noise, and the whole thing has to fit in a chat bubble.
+    detail = " ".join(detail.split())[-1000:].strip()
+    if "permission" not in detail.lower():
+        return ProviderError(
+            f"{provider_label} 执行结束但没有输出任何内容。", detail=detail
+        )
+    remedy = (
+        "该项目已是「完全访问」，请检查 CLI 自身的 permissions.allow 配置。"
+        if permission_mode == "unrestricted"
+        else "请在项目设置的「文件系统权限」中切换为「完全访问」后重试。"
+    )
+    return ProviderError(
+        f"{provider_label} 请求的工具权限在非交互模式下无法确认，已被自动拒绝，"
+        f"因此本次没有生成回答。{remedy}",
+        code="permission_required",
+        detail=detail,
+    )
 
 
 class AgentProvider(ABC):
@@ -135,6 +187,16 @@ class AgentProvider(ABC):
         if not self.models:
             raise ProviderError(f"Provider {self.id} has no configured models")
         if model not in self.models:
+            # Substituting keeps a queued run alive when a model is retired or
+            # when a client sends another provider's id, but it answers as a
+            # different model than the one that was asked for. Leave a trace so
+            # the swap is diagnosable rather than mysterious.
+            logger.warning(
+                "Model %r is not offered by provider %s; falling back to %s",
+                model,
+                self.id,
+                self.models[0],
+            )
             return self.models[0]
         return model
 

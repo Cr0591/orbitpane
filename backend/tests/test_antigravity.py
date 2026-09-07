@@ -13,7 +13,7 @@ from backend.app.agents.antigravity import (
     AntigravityProvider,
     fetch_antigravity_models,
 )
-from backend.app.agents.base import AgentEvent, AgentRequest
+from backend.app.agents.base import AgentEvent, AgentRequest, ProviderError
 from backend.tests.helpers import test_settings
 
 
@@ -168,6 +168,65 @@ class AntigravityProviderTests(IsolatedAsyncioTestCase):
 
             self.assertEqual(completed_responses, ["Recovered final answer"])
             self.assertEqual(emitted, [])
+
+    async def test_run_reports_the_cli_reason_for_an_empty_answer(self) -> None:
+        """Exit 0 with no stdout: stderr holds the only explanation there is."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            provider = AntigravityProvider(test_settings(root))
+            stdout = asyncio.StreamReader()
+            stdout.feed_eof()
+            stderr = asyncio.StreamReader()
+            stderr.feed_data(
+                b'jetski: no output produced - a tool required the "command" '
+                b"permission that headless mode cannot prompt for, so it was "
+                b"auto-denied.\n"
+            )
+            stderr.feed_eof()
+            process = SimpleNamespace(
+                pid=123,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=0,
+            )
+
+            async def wait() -> int:
+                return 0
+
+            process.wait = wait
+
+            async def follow_transcript(*args, **kwargs) -> None:
+                await asyncio.Future()
+
+            async def emit(event: AgentEvent) -> None:
+                return None
+
+            request = AgentRequest(
+                run_id="test-run",
+                conversation_id=1,
+                working_directory=str(root),
+                prompt="hi",
+                history=(),
+                model="test-model",
+                permission_mode="workspace",
+            )
+            with (
+                patch(
+                    "backend.app.agents.antigravity.asyncio.create_subprocess_exec",
+                    return_value=process,
+                ),
+                patch.object(
+                    AntigravityProvider,
+                    "_follow_transcript",
+                    side_effect=follow_transcript,
+                ),
+            ):
+                with self.assertRaises(ProviderError) as raised:
+                    await provider.run(request, emit)
+
+            self.assertEqual(raised.exception.code, "permission_required")
+            self.assertIn("auto-denied", str(raised.exception))
+            self.assertIn("完全访问", str(raised.exception))
 
     async def test_run_recovers_completed_response_when_stdout_remains_open(
         self,

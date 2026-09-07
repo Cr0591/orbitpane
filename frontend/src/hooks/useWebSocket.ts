@@ -22,6 +22,8 @@ export interface RealtimeEvent {
   model?: string
   provider?: string
   code?: string
+  /** Verbatim agent output accompanying an `error` event, when there is any. */
+  detail?: string
   status?: string
   input_chars?: number
   output_chars?: number
@@ -714,7 +716,9 @@ export function useWebSocket(
               : [...previous]
             next.push({
               role: 'system',
-              content: `处理异常: ${asText(data.content) || '未知错误'}`,
+              content: asText(data.content) || '未知错误',
+              errorCode: asText(data.code) || 'provider_error',
+              errorDetail: asText(data.detail),
               isError: true,
             })
             if (requestRejected) {

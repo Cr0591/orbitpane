@@ -277,7 +277,9 @@ class AgentCoordinator:
         )
         self._states[conversation.id] = state
 
-        augmented_prompt = self._augment_prompt(conversation.path, item.content)
+        augmented_prompt = self._augment_prompt(
+            conversation.path, item.content, conversation.permission_mode
+        )
         request = AgentRequest(
             run_id=item.run_id,
             conversation_id=conversation.id,
@@ -302,7 +304,16 @@ class AgentCoordinator:
         self._tasks[conversation.id] = task
 
     @staticmethod
-    def _augment_prompt(working_directory: str, content: str) -> str:
+    def _augment_prompt(
+        working_directory: str, content: str, permission_mode: str
+    ) -> str:
+        # Telling the agent to read the guideline files forces a tool call
+        # before it can answer anything at all. Under a restricted permission
+        # mode that call is auto-denied — print mode has no way to ask — so the
+        # note turns every prompt in the project into a guaranteed empty
+        # answer. Leave the choice to the agent there.
+        if permission_mode != "unrestricted":
+            return content
         try:
             workspace_dir = Path(working_directory)
             existing_rules = [
@@ -412,10 +423,9 @@ class AgentCoordinator:
             state.content = result.content
             state.thought = result.thought
             if not result.content.strip() and not result.interrupted:
-                raise ProviderError(
-                    "Agent completed without generating text output. This usually "
-                    "occurs when a tool operation requires permission or failed."
-                )
+                # Backstop for an adapter that returns empty content instead of
+                # raising; the providers themselves explain the case in detail.
+                raise ProviderError("Agent 执行结束但没有输出任何内容。")
             state.duration = self._elapsed(state)
             if result.interrupted:
                 final_status = "interrupted"
@@ -455,8 +465,9 @@ class AgentCoordinator:
                     conversation_id,
                     state,
                     "error",
-                    code="provider_error",
-                    content=str(exc),
+                    code=exc.code,
+                    content=exc.summary,
+                    detail=exc.detail,
                 ),
             )
             state.duration = self._elapsed(state)

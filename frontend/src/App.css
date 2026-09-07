@@ -1329,8 +1329,102 @@
   box-shadow: var(--shadow-sm);
 }
 
-.system-msg.error {
+/*
+ * A failed turn needs room the pill above does not have: the server sends a
+ * sentence explaining the cause and, where one exists, the setting to change.
+ */
+.system-error {
+  align-self: center;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2-5);
+  width: 100%;
+  max-width: 560px;
+  padding: var(--space-3);
   color: var(--danger-text);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+
+.system-error > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.system-error-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.system-error-body strong {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.system-error-body p {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-secondary);
+  /* CLI output arrives verbatim and can carry long unbroken paths. */
+  overflow-wrap: anywhere;
+}
+
+.system-error-detail summary {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.system-error-detail summary::-webkit-details-marker {
+  display: none;
+}
+
+.system-error-detail summary::before {
+  content: '▸ ';
+}
+
+.system-error-detail[open] summary::before {
+  content: '▾ ';
+}
+
+.system-error-detail pre {
+  margin: var(--space-1-5) 0 0;
+  padding: var(--space-2);
+  max-height: 200px;
+  overflow: auto;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  background: var(--bg-primary);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.system-error-action {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-top: var(--space-0-5);
+  padding: var(--space-1-5) var(--space-2-5);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--danger-text);
+  background: transparent;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.system-error-action:hover {
   background: var(--danger-bg);
   border-color: var(--danger-color);
 }

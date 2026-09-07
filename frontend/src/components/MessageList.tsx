@@ -1,11 +1,12 @@
 import React, { Suspense, lazy } from 'react'
 import { motion } from 'framer-motion'
-import { AlertCircle, Info, FileText, Check, Copy, ThumbsUp, ThumbsDown, RotateCcw, Clock, ListTodo, Gauge, ChevronDown, ChevronUp, History, Sparkles } from 'lucide-react'
+import { AlertCircle, Info, FileText, Check, Copy, ThumbsUp, ThumbsDown, RotateCcw, Clock, ListTodo, Gauge, ChevronDown, ChevronUp, History, Sparkles, ShieldAlert } from 'lucide-react'
 import { LogoIcon } from '../LogoIcon'
 import { AgentExecutionTimeline } from './AgentExecutionTimeline'
 import type { Message } from '../lib/types'
 import { haptic } from '../lib/nativeFeedback'
 import { messageKey } from '../lib/messageIdentity'
+import { OPEN_INSPECTOR_EVENT } from '../lib/appEvents'
 import { formatModelName } from '../lib/providers'
 import { MobileBottomSheet } from './MobileBottomSheet'
 
@@ -38,6 +39,58 @@ interface MessageRowProps {
 }
 
 const MarkdownContent = lazy(() => import('./MarkdownContent'))
+
+/** Title per failure class, so the first line says what kind of problem it is. */
+const ERROR_TITLES: Record<string, string> = {
+  permission_required: 'Agent 权限被拒绝，未生成回答',
+  invalid_request: '请求未被接受',
+  not_found: '项目不存在',
+  busy: '当前项目有任务正在执行',
+  internal_error: '服务内部错误',
+  provider_error: 'Agent 执行失败',
+}
+
+/**
+ * A failed turn, with the control that fixes it.
+ *
+ * These failures are usually a project setting rather than a fault — most
+ * often a tool call that the restricted permission mode auto-denied — and the
+ * remedy is two panels away, so the notice offers it directly instead of
+ * dropping a raw provider string into the transcript and leaving the reader to
+ * work out where to go.
+ */
+function SystemErrorNotice({ message }: { message: Message }) {
+  const code = message.errorCode || 'provider_error'
+  return (
+    <div className="system-error" role="alert">
+      <AlertCircle size={15} aria-hidden="true" />
+      <div className="system-error-body">
+        <strong>{ERROR_TITLES[code] || ERROR_TITLES.provider_error}</strong>
+        <p>{message.content}</p>
+        {message.errorDetail && (
+          <details className="system-error-detail">
+            <summary>Agent 原始输出</summary>
+            <pre>{message.errorDetail}</pre>
+          </details>
+        )}
+        {code === 'permission_required' && (
+          <button
+            type="button"
+            className="system-error-action"
+            onClick={() => {
+              haptic('light')
+              window.dispatchEvent(
+                new CustomEvent(OPEN_INSPECTOR_EVENT, { detail: 'mission' }),
+              )
+            }}
+          >
+            <ShieldAlert size={12} />打开项目权限设置
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /**
  * Memoised so a token arriving for the streaming turn does not re-render every
@@ -365,9 +418,10 @@ export function MessageList({
         const key = messageKey(m, i)
 
         if (m.role === 'system') {
+          if (m.isError) return <SystemErrorNotice key={key} message={m} />
           return (
-            <div key={key} className={`system-msg ${m.isError ? 'error' : ''}`}>
-              {m.isError ? <AlertCircle size={14} /> : <Info size={14} />}
+            <div key={key} className="system-msg">
+              <Info size={14} />
               <span>{m.content}</span>
             </div>
           )

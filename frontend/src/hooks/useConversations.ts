@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiFetch } from '../lib/api'
-import { rememberModelLabels } from '../lib/providers'
+import { formatModelName, rememberModelLabels } from '../lib/providers'
 import { pruneConversationKeys, readJson, writeJson } from '../lib/storage'
 import type { Conversation, DirItem, Provider, ModelOption, ModelsResponse, AgentsResponse, PermissionMode, ToastKind } from '../lib/types'
 
@@ -80,6 +80,18 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
   const [defaultProvider, setDefaultProvider] = useState<string>('antigravity')
   const [models, setModels] = useState<ModelOption[]>([])
   const [selectedModel, setSelectedModelState] = useState<string>('')
+  /**
+   * Mirrors `selectedModel` for readers that run outside React's update cycle.
+   *
+   * Deciding whether a model list replaces the current selection has to happen
+   * before the state is set, because the swap is worth telling the user about
+   * and a toast cannot be raised from inside a state updater.
+   */
+  const selectedModelRef = useRef(selectedModel)
+  const applySelectedModel = useCallback((model: string) => {
+    selectedModelRef.current = model
+    setSelectedModelState(model)
+  }, [])
   const modelsRequestRef = useRef(0)
 
   const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([])
@@ -143,12 +155,26 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
       setModels(nextModels)
       rememberModelLabels(nextModels)
       if (nextModels.length === 0) return
-      setSelectedModelState(previous => {
-        const preferred = activeConvRef.current?.preferred_model
-        const has = (id: string) => nextModels.some(model => model.id === id)
-        if (preferred && has(preferred)) return preferred
-        return has(previous) ? previous : nextModels[0].id
-      })
+      const previous = selectedModelRef.current
+      const preferred = activeConvRef.current?.preferred_model
+      const has = (id: string) => nextModels.some(model => model.id === id)
+      if (preferred && has(preferred)) {
+        applySelectedModel(preferred)
+        return
+      }
+      if (has(previous)) return
+      const fallback = nextModels[0].id
+      // Opening a project served by another agent replaces the selection with
+      // that agent's first model. Silently, this reads as the project having
+      // switched agents on its own, so name the swap rather than let the chip
+      // change under the user.
+      if (previous && previous !== fallback) {
+        showToast(
+          `本项目不支持「${formatModelName(previous)}」，已切换为「${formatModelName(fallback)}」`,
+          'info',
+        )
+      }
+      applySelectedModel(fallback)
     }
 
     return apiFetch<ModelsResponse>(`/api/models?provider=${encodeURIComponent(provider)}`)
@@ -163,7 +189,7 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
         console.error(error)
         applyModels(normalizeModelOptions(readCache<unknown>(cacheKey, [])))
       })
-  }, [defaultProvider])
+  }, [applySelectedModel, defaultProvider, showToast])
 
   const loadConversations = useCallback((isInitial = false) => {
     if (isInitial) setIsConversationsLoading(true)
@@ -183,7 +209,7 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
             if (found) {
               setActiveConv(found)
               activeConvRef.current = found
-              setSelectedModelState(found.preferred_model || '')
+              applySelectedModel(found.preferred_model || '')
               loadModels(found.provider)
               return found
             }
@@ -213,7 +239,7 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
         return null
       })
       .finally(() => setIsConversationsLoading(false))
-  }, [loadModels])
+  }, [applySelectedModel, loadModels])
 
   const updateConversation = useCallback((
     conversationId: number,
@@ -266,7 +292,7 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
   }, [showToast])
 
   const setSelectedModel = useCallback((model: string) => {
-    setSelectedModelState(model)
+    applySelectedModel(model)
     const conversation = activeConvRef.current
     if (conversation && conversation.preferred_model !== model) {
       void updateConversation(
@@ -275,7 +301,7 @@ export function useConversations(showToast: (msg: string, kind?: ToastKind) => v
         { silent: true },
       )
     }
-  }, [updateConversation])
+  }, [applySelectedModel, updateConversation])
 
   const loadDir = useCallback((path: string) => {
     const suffix = path ? `?path=${encodeURIComponent(path)}` : ''
