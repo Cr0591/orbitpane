@@ -6,7 +6,11 @@ from subprocess import CompletedProcess
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
-from backend.app.agents.codex import CodexCliProvider, fetch_codex_models
+from backend.app.agents.codex import (
+    CodexCliProvider,
+    fetch_codex_models,
+    split_reasoning_effort,
+)
 from backend.app.agents.base import AgentRequest
 from backend.app.config import Settings
 
@@ -83,6 +87,101 @@ class CodexProviderTests(TestCase):
                 ("gpt-compatible", "GPT Compatible"),
             ),
         )
+
+    def test_fetch_models_offers_every_supported_reasoning_effort(self) -> None:
+        completed = CompletedProcess(
+            args=["codex", "debug", "models"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-5.5",
+                            "visibility": "list",
+                            "display_name": "GPT-5.5",
+                            "default_reasoning_level": "medium",
+                            "supported_reasoning_levels": [
+                                {"effort": "low", "description": "Fast"},
+                                {"effort": "medium", "description": "Balanced"},
+                                {"effort": "xhigh", "description": "Extra"},
+                                {"effort": "xhigh", "description": "Duplicate"},
+                                {"effort": 'high"injected', "description": "Bad"},
+                                {"description": "No effort"},
+                            ],
+                        },
+                    ]
+                }
+            ),
+            stderr="",
+        )
+        with patch(
+            "backend.app.agents.codex.subprocess.run",
+            return_value=completed,
+        ):
+            models = fetch_codex_models("codex")
+
+        # The bare slug stays first so existing conversations keep resolving to
+        # it; only well-formed, distinct levels are offered.
+        self.assertEqual(
+            models,
+            (
+                ("gpt-5.5", "GPT-5.5 (Default)"),
+                ("gpt-5.5@low", "GPT-5.5 (Low)"),
+                ("gpt-5.5@medium", "GPT-5.5 (Medium)"),
+                ("gpt-5.5@xhigh", "GPT-5.5 (Extra High)"),
+            ),
+        )
+
+    def test_effort_is_split_only_from_an_explicit_suffix(self) -> None:
+        cases = {
+            "gpt-5.5@high": ("gpt-5.5", "high"),
+            "gpt-5.5": ("gpt-5.5", ""),
+            # A slug that merely ends in an effort word is still a bare slug.
+            "gpt-5.1-codex-max": ("gpt-5.1-codex-max", ""),
+            "gpt-5.5@": ("gpt-5.5@", ""),
+            "@high": ("@high", ""),
+            'gpt-5.5@high"': ('gpt-5.5@high"', ""),
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(split_reasoning_effort(model), expected)
+
+    def test_reasoning_effort_is_only_overridden_when_pinned(self) -> None:
+        self.assertNotIn(
+            "model_reasoning_effort", " ".join(self.provider._reasoning_args())
+        )
+        self.assertEqual(
+            self.provider._reasoning_args("xhigh")[-2:],
+            ["--config", 'model_reasoning_effort="xhigh"'],
+        )
+
+    def test_withdrawn_effort_keeps_the_model(self) -> None:
+        provider = CodexCliProvider(
+            replace(
+                self.settings,
+                codex_models=("gpt-first", "gpt-5.5", "gpt-5.5@high"),
+            )
+        )
+        self.assertEqual(provider.validate_model("gpt-5.5@high"), "gpt-5.5@high")
+        # A level the catalog no longer lists falls back to the same model at
+        # its default effort, not to a different model.
+        with self.assertLogs("backend.app.agents.codex", "WARNING"):
+            self.assertEqual(provider.validate_model("gpt-5.5@ultra"), "gpt-5.5")
+        self.assertEqual(provider.validate_model("gpt-gone@high"), "gpt-first")
+        self.assertEqual(provider.validate_model("auto"), "gpt-first")
+
+    def test_pinned_models_name_their_effort(self) -> None:
+        provider = CodexCliProvider(
+            replace(self.settings, codex_models=("gpt-5.5", "gpt-5.5@xhigh"))
+        )
+        with patch.dict("os.environ", {"CODEX_MODELS": "gpt-5.5,gpt-5.5@xhigh"}):
+            self.assertEqual(
+                provider.model_catalog(),
+                [
+                    {"id": "gpt-5.5", "display_name": "GPT 5.5"},
+                    {"id": "gpt-5.5@xhigh", "display_name": "GPT 5.5 (Extra High)"},
+                ],
+            )
 
     def test_format_thought_command_execution(self) -> None:
         seen_started: set[str] = set()
@@ -311,6 +410,51 @@ class CodexRunTests(IsolatedAsyncioTestCase):
         )
         command = create_process.await_args.args
         self.assertIn('model_reasoning_summary="detailed"', command)
+        # A bare model leaves the effort to Codex's own configuration.
+        self.assertFalse(any("model_reasoning_effort" in arg for arg in command))
+
+    async def test_run_pins_the_reasoning_effort_of_the_selected_entry(self) -> None:
+        settings = replace(
+            Settings.from_env(),
+            codex_enabled=True,
+            codex_models=("gpt-test", "gpt-test@xhigh"),
+        )
+        provider = CodexCliProvider(settings)
+        process = _FakeProcess(
+            [
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "agent_message", "text": "Done."},
+                },
+            ]
+        )
+
+        async def emit(_event) -> None:
+            return None
+
+        request = AgentRequest(
+            run_id="run-1",
+            conversation_id=1,
+            working_directory="/tmp",
+            prompt="test",
+            history=(),
+            model="gpt-test@xhigh",
+        )
+        create_process = AsyncMock(return_value=process)
+        with (
+            patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"),
+            patch(
+                "backend.app.agents.codex.asyncio.create_subprocess_exec",
+                create_process,
+            ),
+        ):
+            await provider.run(request, emit)
+
+        command = list(create_process.await_args.args)
+        # Codex receives the real slug; the effort travels as its own setting.
+        self.assertEqual(command[command.index("--model") + 1], "gpt-test")
+        self.assertIn('model_reasoning_effort="xhigh"', command)
+        self.assertNotIn("gpt-test@xhigh", command)
 
 
 class CodexAvailabilityTests(IsolatedAsyncioTestCase):

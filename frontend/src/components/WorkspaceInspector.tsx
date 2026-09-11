@@ -81,7 +81,8 @@ export function WorkspaceInspector({ onActiveTaskCountChange }: WorkspaceInspect
   const [tab, setTab] = useState<InspectorTab>(initialPanel === 'tasks' ? 'tasks' : 'mission')
   const [overlayOpen, setOverlayOpen] = useState(initialPanel === 'tasks')
   const [stats, setStats] = useState<ConversationStats>(EMPTY_STATS)
-  const [workspace, setWorkspace] = useState<WorkspaceStatus>(EMPTY_WORKSPACE)
+  /** `null` until this project's git status has answered. */
+  const [workspace, setWorkspace] = useState<WorkspaceStatus | null>(null)
   const [tasks, setTasks] = useState<TaskRecord[]>([])
   const [loading, setLoading] = useState(false)
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null)
@@ -102,32 +103,39 @@ export function WorkspaceInspector({ onActiveTaskCountChange }: WorkspaceInspect
 
   const loadInspector = useCallback(async (quiet = false) => {
     const requestId = ++inspectorRequestRef.current
+    const isCurrent = () => requestId === inspectorRequestRef.current
     if (!quiet) setLoading(true)
     if (!activeConversationId) {
       setTasks([])
-      if (requestId === inspectorRequestRef.current) setLoading(false)
+      if (isCurrent()) setLoading(false)
       return
     }
-    try {
-      const [taskResponse, nextStats, nextWorkspace] = await Promise.all([
-        apiFetch<{ items: TaskRecord[] }>(`/api/conversations/${activeConversationId}/tasks`),
-        apiFetch<ConversationStats>(`/api/conversations/${activeConversationId}/stats`),
-        apiFetch<WorkspaceStatus>(`/api/conversations/${activeConversationId}/workspace-status`),
-      ])
-      if (requestId !== inspectorRequestRef.current) return
-      setTasks(taskResponse.items)
-      setStats(nextStats)
-      setWorkspace(nextWorkspace)
-    } catch (error) {
-      console.error(error)
-    } finally {
-      if (requestId === inspectorRequestRef.current) setLoading(false)
+    const base = `/api/conversations/${activeConversationId}`
+    // Git status shells out to `git`, which can take seconds on a large
+    // repository. Awaited together with the other two, it kept the whole panel
+    // on its spinner until git finished, and a git failure threw the task list
+    // and the stats away with it. It now lands on its own, into its own card.
+    void apiFetch<WorkspaceStatus>(`${base}/workspace-status`)
+      .then(next => { if (isCurrent()) setWorkspace(next) })
+      .catch(error => {
+        console.error(error)
+        if (isCurrent()) setWorkspace(previous => previous ?? EMPTY_WORKSPACE)
+      })
+    const results = await Promise.allSettled([
+      apiFetch<{ items: TaskRecord[] }>(`${base}/tasks`)
+        .then(response => { if (isCurrent()) setTasks(response.items) }),
+      apiFetch<ConversationStats>(`${base}/stats`)
+        .then(next => { if (isCurrent()) setStats(next) }),
+    ])
+    for (const result of results) {
+      if (result.status === 'rejected') console.error(result.reason)
     }
+    if (isCurrent()) setLoading(false)
   }, [activeConversationId])
 
   useEffect(() => {
     setStats(EMPTY_STATS)
-    setWorkspace(EMPTY_WORKSPACE)
+    setWorkspace(null)
     setTasks([])
     void loadInspector()
   }, [activeConversationId, loadInspector])
@@ -447,9 +455,11 @@ export function WorkspaceInspector({ onActiveTaskCountChange }: WorkspaceInspect
               <section className="inspector-card change-radar-card">
                 <div className="inspector-card-title">
                   <span><FileDiff size={14} />未提交改动</span>
-                  {workspace.is_git && <span className="branch-chip"><GitBranch size={11} />{workspace.branch || 'detached'}</span>}
+                  {workspace?.is_git && <span className="branch-chip"><GitBranch size={11} />{workspace.branch || 'detached'}</span>}
                 </div>
-                {!workspace.is_git ? (
+                {workspace === null ? (
+                  <p className="inspector-empty">正在读取 Git 状态…</p>
+                ) : !workspace.is_git ? (
                   <p className="inspector-empty">当前目录不是 Git 工作区。</p>
                 ) : workspace.files.length === 0 ? (
                   <div className="clean-worktree"><CheckCircle2 size={16} />工作树干净</div>

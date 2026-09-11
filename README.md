@@ -176,6 +176,17 @@ export CODEX_REASONING_SUMMARY=detailed
 defaults to `detailed`, so supported Codex models publish useful reasoning
 summaries to the execution timeline. This does not enable raw hidden reasoning.
 
+Each reasoning effort a Codex model supports (its `supported_reasoning_levels`
+in `codex debug models`) is offered as a model entry of its own, the way the
+Antigravity ids already carry theirs: `gpt-5.5@high` runs `gpt-5.5` with
+`model_reasoning_effort="high"`. The bare slug, labelled *Default*, passes no
+effort, so Codex falls back to `model_reasoning_effort` in the server's
+`~/.codex/config.toml` — which the Codex TUI rewrites whenever a level is picked
+there — and, when that is unset, to the model's own `default_reasoning_level`.
+Projects created before the levels were listed keep the bare slug and so behave
+as they did. `CODEX_MODELS` accepts the same `slug@effort` form for a shorter
+list.
+
 Model lists are discovered once per backend process from `antigravity models`
 (or `agy models`, when configured as the command) and `codex debug models`.
 `ORBITPANE_ANTIGRAVITY_MODELS` and `CODEX_MODELS` can still be set to a

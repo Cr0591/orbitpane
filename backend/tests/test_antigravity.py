@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from subprocess import DEVNULL, CompletedProcess
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from backend.app.agents.antigravity import (
     fetch_antigravity_models,
 )
 from backend.app.agents.base import AgentEvent, AgentRequest, ProviderError
+from backend.app.agents.registry import ProviderRegistry
+from backend.app.database import Database
 from backend.tests.helpers import test_settings
 
 
@@ -359,3 +362,140 @@ class AntigravityModelRefreshTests(IsolatedAsyncioTestCase):
                 await provider.ensure_model_catalog()
                 await provider._catalog._refresh_task
                 self.assertEqual(provider.models, ("model-v1",))
+
+
+class RememberedCatalogTests(IsolatedAsyncioTestCase):
+    """A restart must not make the model picker wait on a network probe."""
+
+    def _database(self, directory: str) -> Database:
+        database = Database(Path(directory) / "orbitpane-test.db")
+        database.migrate()
+        return database
+
+    async def test_remembered_catalog_is_served_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(temp_dir)
+            database.save_model_catalog("antigravity", (("model-v1", "Model V1"),))
+            provider = AntigravityProvider(test_settings(Path(temp_dir)), database)
+            probe_started = asyncio.Event()
+            release_probe = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def slow_probe(_command: str) -> tuple[tuple[str, str], ...]:
+                loop.call_soon_threadsafe(probe_started.set)
+                asyncio.run_coroutine_threadsafe(release_probe.wait(), loop).result()
+                return (("model-v2", "Model V2"),)
+
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    side_effect=slow_probe,
+                ),
+            ):
+                # The probe is held open for the whole read: this can only
+                # return if nothing waits on it.
+                await asyncio.wait_for(provider.ensure_model_catalog(), timeout=2)
+                self.assertEqual(provider.models, ("model-v1",))
+                self.assertEqual(provider.model_display_name("model-v1"), "Model V1")
+
+                await asyncio.wait_for(probe_started.wait(), timeout=2)
+                release_probe.set()
+                await provider._catalog._refresh_task
+                self.assertEqual(provider.models, ("model-v2",))
+
+            # What the probe found is what the next start serves.
+            self.assertEqual(
+                database.load_model_catalog("antigravity"), (("model-v2", "Model V2"),)
+            )
+
+    async def test_first_probe_is_remembered_and_empty_ones_are_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(temp_dir)
+            provider = AntigravityProvider(test_settings(Path(temp_dir)), database)
+            provider._catalog._ttl_seconds = 0
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    side_effect=[(("live-model", "Live Model"),), ()],
+                ),
+            ):
+                # Nothing remembered yet, so the very first read waits.
+                await provider.ensure_model_catalog()
+                self.assertEqual(provider.models, ("live-model",))
+                await provider.ensure_model_catalog()
+                await provider._catalog._refresh_task
+
+            # A failed probe neither empties the picker nor the memory of it.
+            self.assertEqual(provider.models, ("live-model",))
+            self.assertEqual(
+                database.load_model_catalog("antigravity"),
+                (("live-model", "Live Model"),),
+            )
+
+    async def test_unreadable_memory_falls_back_to_probing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Never migrated: the table is missing, as on a broken database.
+            database = Database(Path(temp_dir) / "orbitpane-test.db")
+            provider = AntigravityProvider(test_settings(Path(temp_dir)), database)
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                    return_value=(("live-model", "Live Model"),),
+                ),
+                self.assertLogs("backend.app.agents.base", "ERROR"),
+            ):
+                await provider.ensure_model_catalog()
+            self.assertEqual(provider.models, ("live-model",))
+
+    def test_malformed_rows_read_as_nothing_remembered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(temp_dir)
+            with database.connect() as connection:
+                connection.executemany(
+                    "INSERT INTO model_catalogs(provider, models) VALUES (?, ?)",
+                    [
+                        ("broken", "not json"),
+                        ("scalar", "42"),
+                        ("mixed", json.dumps([["ok", "OK"], ["no-label"], [1, 2], "x"])),
+                    ],
+                )
+            self.assertEqual(database.load_model_catalog("broken"), ())
+            self.assertEqual(database.load_model_catalog("scalar"), ())
+            self.assertEqual(database.load_model_catalog("mixed"), (("ok", "OK"),))
+            self.assertEqual(database.load_model_catalog("absent"), ())
+
+
+class ProviderRegistryRefreshTests(IsolatedAsyncioTestCase):
+    async def test_one_providers_list_never_waits_on_another_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = replace(
+                test_settings(Path(temp_dir)), codex_enabled=True, codex_models=()
+            )
+            registry = ProviderRegistry(settings)
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "backend.app.agents.antigravity.fetch_antigravity_models",
+                ) as antigravity_probe,
+                patch(
+                    "backend.app.agents.codex.fetch_codex_models",
+                    return_value=(("gpt-test", "GPT Test"),),
+                ) as codex_probe,
+                patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"),
+            ):
+                catalog = await registry.catalog(refresh="codex")
+
+        codex_probe.assert_called_once()
+        antigravity_probe.assert_not_called()
+        by_id = {entry["id"]: entry for entry in catalog}
+        self.assertEqual(
+            [model["id"] for model in by_id["codex"]["models"]], ["gpt-test"]  # type: ignore[index]
+        )
+        # Still described, from what it had: the configured list.
+        self.assertEqual(
+            [model["id"] for model in by_id["antigravity"]["models"]],  # type: ignore[index]
+            ["test-model"],
+        )

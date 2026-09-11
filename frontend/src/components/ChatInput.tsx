@@ -114,10 +114,16 @@ export function ChatInput({
   useEffect(() => {
     if (!mention || activeConversationId === undefined) return
     const requestId = ++searchRequestRef.current
+    // Each keystroke supersedes the last search. Ignoring the stale answer is
+    // not enough on its own: the request stayed in flight until the server
+    // had walked the workspace for it. (The server also skips a search that a
+    // newer one overtook while it was queued.)
+    const controller = new AbortController()
     setIsFileSearchLoading(true)
     const timeout = window.setTimeout(() => {
       apiFetch<FileSearchResponse>(
         `/api/conversations/${activeConversationId}/files?q=${encodeURIComponent(mention.query)}&limit=50`,
+        { signal: controller.signal },
       )
         .then(data => {
           if (requestId !== searchRequestRef.current) return
@@ -137,6 +143,7 @@ export function ChatInput({
     return () => {
       window.clearTimeout(timeout)
       searchRequestRef.current += 1
+      controller.abort()
     }
   }, [activeConversationId, mention])
 

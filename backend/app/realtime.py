@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -10,10 +11,10 @@ from pathlib import Path
 
 from fastapi import WebSocket
 
-from .agents.base import AgentEvent, AgentRequest, ProviderError
+from .agents.base import AgentEvent, AgentRequest, AgentResult, ProviderError
 from .agents.registry import ProviderRegistry
 from .database import Database
-from .models import Conversation
+from .models import Conversation, Message
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,21 @@ class ConnectionHub:
                 self._connections.pop(conversation_id, None)
             self._send_locks.pop(websocket, None)
 
+    @staticmethod
+    def _encode(message: dict[str, object]) -> str:
+        # The encoding Starlette's `send_json` would apply.
+        return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+
     async def send(
         self,
         websocket: WebSocket,
         conversation_id: int,
         message: dict[str, object],
+    ) -> bool:
+        return await self._send_text(websocket, conversation_id, self._encode(message))
+
+    async def _send_text(
+        self, websocket: WebSocket, conversation_id: int, text: str
     ) -> bool:
         async with self._lock:
             if websocket not in self._connections.get(conversation_id, ()):
@@ -59,7 +70,7 @@ class ConnectionHub:
             send_lock = self._send_locks[websocket]
         try:
             async with send_lock:
-                await websocket.send_json(message)
+                await websocket.send_text(text)
             return True
         except Exception:
             await self.disconnect(websocket, conversation_id)
@@ -68,8 +79,13 @@ class ConnectionHub:
     async def broadcast(self, conversation_id: int, message: dict[str, object]) -> None:
         async with self._lock:
             sockets = tuple(self._connections.get(conversation_id, ()))
+        if not sockets:
+            return
+        # Stream events repeat the whole answer so far, so encoding one is real
+        # work on the event loop: do it once, not once per open tab.
+        text = self._encode(message)
         for websocket in sockets:
-            await self.send(websocket, conversation_id, message)
+            await self._send_text(websocket, conversation_id, text)
 
 
 @dataclass(slots=True)
@@ -146,6 +162,8 @@ class AgentCoordinator:
         selected_model = provider.validate_model(
             model or conversation.preferred_model or provider.models[0]
         )
+        # A summary's covered range is fixed when it starts, not when queued:
+        # `_prepare_run` reads it then.
         return QueueItem(
             run_id=f"{conversation.id}-{uuid.uuid4().hex}",
             conversation=conversation,
@@ -153,9 +171,6 @@ class AgentCoordinator:
             model=selected_model,
             provider=provider_name,
             is_summary=is_summary,
-            covered_through_id=(
-                self.database.max_message_id(conversation.id) if is_summary else 0
-            ),
         )
 
     async def submit(
@@ -177,7 +192,8 @@ class AgentCoordinator:
         async with self._lock:
             existing = self._tasks.get(conversation.id)
             is_busy = bool(existing and not existing.done())
-            self.database.create_run(
+            await asyncio.to_thread(
+                self.database.create_run,
                 item.run_id,
                 conversation.id,
                 status="queued" if is_busy else "starting",
@@ -191,7 +207,7 @@ class AgentCoordinator:
                 queue.append(item)
                 result = item.as_dict(len(queue))
             else:
-                self._start_unlocked(item)
+                await self._start_locked(item)
                 result = {
                     **item.as_dict(0),
                     "status": "running",
@@ -225,7 +241,8 @@ class AgentCoordinator:
             existing = self._tasks.get(conversation.id)
             if existing and not existing.done():
                 raise AgentBusyError("Agent is already processing this conversation")
-            self.database.create_run(
+            await asyncio.to_thread(
+                self.database.create_run,
                 item.run_id,
                 conversation.id,
                 status="starting",
@@ -234,9 +251,15 @@ class AgentCoordinator:
                 provider=item.provider,
                 is_summary=is_summary,
             )
-            self._start_unlocked(item)
+            await self._start_locked(item)
 
-    def _start_unlocked(self, item: QueueItem) -> None:
+    def _prepare_run(self, item: QueueItem) -> tuple[tuple[Message, ...], str]:
+        """Everything a run needs from disk before it starts, in one thread hop.
+
+        Runs in a worker thread: SQLite waits up to its busy timeout for a
+        competing writer, and on the event loop that wait would stall every
+        request and every stream in the process, not just this one.
+        """
         conversation = item.conversation
         if item.is_summary:
             item.covered_through_id = self.database.max_message_id(conversation.id)
@@ -263,6 +286,15 @@ class AgentCoordinator:
                 run_id=item.run_id,
                 input_chars=len(item.content),
             )
+        augmented_prompt = self._augment_prompt(
+            conversation.path, item.content, conversation.permission_mode
+        )
+        return history, augmented_prompt
+
+    async def _start_locked(self, item: QueueItem) -> None:
+        """Start `item` now. The caller holds `self._lock`."""
+        conversation = item.conversation
+        history, augmented_prompt = await asyncio.to_thread(self._prepare_run, item)
 
         context_chars = sum(len(message.content) for message in history)
         state = TaskState(
@@ -277,9 +309,6 @@ class AgentCoordinator:
         )
         self._states[conversation.id] = state
 
-        augmented_prompt = self._augment_prompt(
-            conversation.path, item.content, conversation.permission_mode
-        )
         request = AgentRequest(
             run_id=item.run_id,
             conversation_id=conversation.id,
@@ -290,7 +319,8 @@ class AgentCoordinator:
             permission_mode=conversation.permission_mode,
         )
         provider = self.providers.get(item.provider)
-        self.database.update_run(
+        await asyncio.to_thread(
+            self.database.update_run,
             item.run_id,
             status="running",
             started_at=_utc_now(),
@@ -430,26 +460,9 @@ class AgentCoordinator:
             if result.interrupted:
                 final_status = "interrupted"
             if result.content.strip():
-                message_id = self.database.add_message(
-                    conversation_id,
-                    role,
-                    result.content,
-                    thought=result.thought,
-                    duration=state.duration,
-                    model=state.model,
-                    provider=state.provider,
-                    run_id=state.run_id,
-                    input_chars=state.input_chars,
-                    output_chars=len(result.content),
-                    context_chars=state.context_chars,
+                await asyncio.to_thread(
+                    self._persist_answer, conversation_id, role, state, result
                 )
-                if state.is_summary:
-                    self.database.create_summary_checkpoint(
-                        conversation_id,
-                        message_id,
-                        state.summary_covered_through_id,
-                        result.content,
-                    )
         except asyncio.CancelledError:
             final_status = "interrupted"
             error_message = "任务已取消"
@@ -472,7 +485,8 @@ class AgentCoordinator:
             )
             state.duration = self._elapsed(state)
             if state.content.strip():
-                self.database.add_message(
+                await asyncio.to_thread(
+                    self.database.add_message,
                     conversation_id,
                     "agent",
                     state.content,
@@ -508,7 +522,8 @@ class AgentCoordinator:
             await asyncio.gather(elapsed_task, return_exceptions=True)
             if state.duration is None:
                 state.duration = self._elapsed(state)
-            self.database.update_run(
+            await asyncio.to_thread(
+                self.database.update_run,
                 state.run_id,
                 status=final_status,
                 completed_at=_utc_now(),
@@ -536,8 +551,33 @@ class AgentCoordinator:
                 if not queue:
                     self._queues.pop(conversation_id, None)
                 if next_item is not None:
-                    self._start_unlocked(next_item)
+                    await self._start_locked(next_item)
             await self._broadcast_queue(conversation_id, state.run_id)
+
+    def _persist_answer(
+        self, conversation_id: int, role: str, state: TaskState, result: AgentResult
+    ) -> None:
+        """Store a finished answer (and its checkpoint); runs in a worker thread."""
+        message_id = self.database.add_message(
+            conversation_id,
+            role,
+            result.content,
+            thought=result.thought,
+            duration=state.duration or 0.0,
+            model=state.model,
+            provider=state.provider,
+            run_id=state.run_id,
+            input_chars=state.input_chars,
+            output_chars=len(result.content),
+            context_chars=state.context_chars,
+        )
+        if state.is_summary:
+            self.database.create_summary_checkpoint(
+                conversation_id,
+                message_id,
+                state.summary_covered_through_id,
+                result.content,
+            )
 
     async def _broadcast_queue(
         self, conversation_id: int, run_id: str | None = None
@@ -581,7 +621,8 @@ class AgentCoordinator:
                 if model is not None:
                     provider = self.providers.get(item.provider)
                     item.model = provider.validate_model(model)
-                self.database.update_run(
+                await asyncio.to_thread(
+                    self.database.update_run,
                     run_id,
                     prompt=item.content,
                     model=item.model,
@@ -603,7 +644,8 @@ class AgentCoordinator:
                 self._queues[conversation_id] = next_queue
             else:
                 self._queues.pop(conversation_id, None)
-            self.database.update_run(
+            await asyncio.to_thread(
+                self.database.update_run,
                 run_id,
                 status="canceled",
                 completed_at=_utc_now(),
@@ -636,13 +678,19 @@ class AgentCoordinator:
     async def cancel(self, conversation_id: int, reason: str = "工作区已删除") -> None:
         async with self._lock:
             queued = self._queues.pop(conversation_id, [])
-        for item in queued:
-            self.database.update_run(
-                item.run_id,
-                status="canceled",
-                completed_at=_utc_now(),
-                error=reason,
-            )
+        if queued:
+            completed_at = _utc_now()
+
+            def mark_canceled() -> None:
+                for item in queued:
+                    self.database.update_run(
+                        item.run_id,
+                        status="canceled",
+                        completed_at=completed_at,
+                        error=reason,
+                    )
+
+            await asyncio.to_thread(mark_canceled)
         await self._broadcast_queue(conversation_id)
         await self.interrupt(conversation_id)
         async with self._lock:
@@ -664,7 +712,7 @@ class AgentCoordinator:
         client discard the transient turns it is still rendering.
         """
         await self.cancel(conversation_id, reason=reason)
-        self.database.clear_history(conversation_id)
+        await asyncio.to_thread(self.database.clear_history, conversation_id)
         await self.hub.broadcast(
             conversation_id,
             {
@@ -700,10 +748,18 @@ class AgentCoordinator:
             "queue": self.queue_items(conversation_id),
         }
 
-    def task_catalog(
+    async def task_catalog(
         self, *, conversation_id: int | None = None, limit: int = 100
     ) -> list[dict[str, object]]:
-        records = self.database.list_runs(conversation_id=conversation_id, limit=limit)
+        """Run records merged with the live queue.
+
+        The records come from a worker thread; the queue is read back here on
+        the event loop, which is the only place it is ever mutated — reading it
+        from a threadpool route raced with the loop.
+        """
+        records = await asyncio.to_thread(
+            self.database.list_runs, conversation_id=conversation_id, limit=limit
+        )
         queued = {
             item.run_id: item.as_dict(position)
             for queued_conversation_id, items in self._queues.items()

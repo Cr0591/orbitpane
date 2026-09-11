@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -85,6 +86,10 @@ FILE_SEARCH_IGNORED_DIRECTORIES = {
     "node_modules",
 }
 FILE_SEARCH_SCAN_LIMIT = 50_000
+#: Workspace walks allowed to run at once; further searches wait for a slot.
+FILE_SEARCH_CONCURRENCY = 2
+#: Size of the event loop's default executor, which `asyncio.to_thread` uses.
+IO_THREADS = 32
 
 
 def _file_match_score(relative_path: str, query: str) -> tuple[int, int, str] | None:
@@ -361,9 +366,14 @@ def _workspace_git_status(workspace: Path) -> dict[str, object]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database = Database(resolved_settings.database_path)
-    providers = ProviderRegistry(resolved_settings)
+    providers = ProviderRegistry(resolved_settings, store=database)
     hub = ConnectionHub()
     coordinator = AgentCoordinator(database, providers, hub)
+    # Walking a large workspace is CPU-bound Python holding the GIL, so running
+    # many at once slows the event loop's own thread down, not just the walks.
+    file_search_slots = asyncio.Semaphore(FILE_SEARCH_CONCURRENCY)
+    #: Newest search per conversation, so an overtaken one can be skipped.
+    file_search_generations: dict[int, int] = {}
 
     async def sweep_dead_shares() -> None:
         """Delete expired and orphaned snapshots on a timer.
@@ -384,6 +394,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # `asyncio.to_thread` shares one executor sized from the CPU count —
+        # six threads on a two-core host — between quick SQLite calls and jobs
+        # that hold a thread for seconds: CLI model probes, git, workspace
+        # walks. Six such jobs at once would leave a WebSocket's conversation
+        # lookup waiting behind them. These threads mostly wait on disk and
+        # subprocesses, so a larger pool costs little.
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(
+                max_workers=IO_THREADS, thread_name_prefix="orbitpane-io"
+            )
+        )
         database.migrate()
         sweeper = asyncio.create_task(sweep_dead_shares())
         # Discovering models means shelling out to each agent CLI, so it runs
@@ -517,9 +538,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/models", dependencies=[Depends(require_auth)])
     async def get_models(provider: str | None = None):
         provider_id = provider or resolved_settings.default_provider
-        # One refresh covers both lists below, and it is the only await here:
-        # everything after it reads warm caches.
-        catalog = await providers.catalog()
+        # Only the requested provider is refreshed: the other entries below
+        # come from cache, so this list never waits on another CLI's probe.
+        catalog = await providers.catalog(refresh=provider_id)
         selected = providers.get(provider_id)
         return {
             "provider": provider_id,
@@ -840,17 +861,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/tasks", dependencies=[Depends(require_auth)])
     async def list_tasks(limit: int = Query(default=100, ge=1, le=200)):
-        return {"items": coordinator.task_catalog(limit=limit)}
+        return {"items": await coordinator.task_catalog(limit=limit)}
 
     @app.get(
         "/api/conversations/{conversation_id}/tasks",
         dependencies=[Depends(require_auth)],
     )
-    def conversation_tasks(conversation_id: int):
-        if database.get_conversation(conversation_id) is None:
+    async def conversation_tasks(conversation_id: int):
+        # Async on purpose: the queue and the running state live on the event
+        # loop, so they are read here while only the SQLite parts go to a thread.
+        if await asyncio.to_thread(database.get_conversation, conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return {
-            "items": coordinator.task_catalog(conversation_id=conversation_id),
+            "items": await coordinator.task_catalog(conversation_id=conversation_id),
             "queue": coordinator.queue_items(conversation_id),
             "running": coordinator.sync_message(conversation_id),
         }
@@ -976,13 +999,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not workspace.is_dir():
             raise HTTPException(status_code=400, detail="Conversation path must be a directory")
 
-        items, truncated = await asyncio.to_thread(
-            _search_workspace_files,
-            resolved_settings,
-            workspace,
-            q,
-            limit,
-        )
+        generation = file_search_generations.get(conversation_id, 0) + 1
+        file_search_generations[conversation_id] = generation
+        async with file_search_slots:
+            # The @-picker supersedes its search on every keystroke and only
+            # reads the newest answer. One overtaken by a newer search for the
+            # same project while it waited here is skipped rather than walked,
+            # so the query on screen is not queued behind stale ones. (Client
+            # disconnects cannot stand in for this: behind the HTTP middleware
+            # `Request.is_disconnected()` never reports one.)
+            if file_search_generations.get(conversation_id) != generation:
+                return {"items": [], "truncated": False}
+            items, truncated = await asyncio.to_thread(
+                _search_workspace_files,
+                resolved_settings,
+                workspace,
+                q,
+                limit,
+            )
         return {
             "items": items,
             "truncated": truncated,

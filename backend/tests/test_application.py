@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import httpx
 
 from backend.app.application import (
+    FILE_SEARCH_CONCURRENCY,
     SHARE_MAX_PER_CONVERSATION,
     ShareTokenLogFilter,
     create_app,
@@ -241,6 +243,83 @@ class ApplicationTests(IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["path"], str(app_file.resolve()))
         self.assertEqual(items[0]["relative_path"], "frontend/src/App.tsx")
         self.assertFalse(any("node_modules" in item["path"] for item in items))
+
+    async def test_overtaken_file_search_is_not_walked(self) -> None:
+        """Typing in the @-picker must not queue the newest query behind stale ones."""
+        headers = await self.login_headers()
+        created = await self.client.post(
+            "/api/conversations",
+            headers=headers,
+            json={"name": "Big", "path": str(self.workspace), "provider": "antigravity"},
+        )
+        url = f"/api/conversations/{created.json()['id']}/files"
+        release = threading.Event()
+        walked: list[str] = []
+
+        def slow_walk(_settings, _workspace, query, _limit):
+            walked.append(query)
+            release.wait(5)
+            return [{"name": query, "path": query, "relative_path": query}], False
+
+        def search(query: str) -> asyncio.Task[httpx.Response]:
+            return asyncio.create_task(
+                self.client.get(url, headers=headers, params={"q": query})
+            )
+
+        with patch(
+            "backend.app.application._search_workspace_files", side_effect=slow_walk
+        ):
+            holders = [search(f"hold-{slot}") for slot in range(FILE_SEARCH_CONCURRENCY)]
+            while len(walked) < FILE_SEARCH_CONCURRENCY:
+                await asyncio.sleep(0.01)
+            # Both queue for a slot; the second overtakes the first.
+            overtaken = search("stale")
+            await asyncio.sleep(0.05)
+            latest = search("latest")
+            await asyncio.sleep(0.05)
+            release.set()
+            responses = await asyncio.gather(*holders, overtaken, latest)
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertNotIn("stale", walked)
+        self.assertEqual(responses[-2].json()["items"], [])
+        self.assertEqual(
+            [item["name"] for item in responses[-1].json()["items"]], ["latest"]
+        )
+
+    async def test_task_routes_merge_records_with_the_live_queue(self) -> None:
+        headers = await self.login_headers()
+        created = await self.client.post(
+            "/api/conversations",
+            headers=headers,
+            json={"name": "Tasks", "path": str(self.workspace), "provider": "antigravity"},
+        )
+        conversation_id = created.json()["id"]
+        database = self.app.state.database
+        database.create_run(
+            "run-1",
+            conversation_id,
+            status="completed",
+            prompt="hello",
+            model="test-model",
+            provider="antigravity",
+            is_summary=False,
+        )
+
+        everything = await self.client.get("/api/tasks", headers=headers)
+        scoped = await self.client.get(
+            f"/api/conversations/{conversation_id}/tasks", headers=headers
+        )
+        missing = await self.client.get("/api/conversations/999999/tasks", headers=headers)
+
+        self.assertEqual(everything.status_code, 200, everything.text)
+        self.assertEqual([item["run_id"] for item in everything.json()["items"]], ["run-1"])
+        self.assertEqual(scoped.status_code, 200, scoped.text)
+        self.assertEqual(
+            scoped.json(),
+            {"items": everything.json()["items"], "queue": [], "running": None},
+        )
+        self.assertEqual(missing.status_code, 404)
 
     async def test_conversation_file_search_requires_existing_conversation(self) -> None:
         response = await self.client.get(

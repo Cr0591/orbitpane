@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 
@@ -15,21 +17,101 @@ from .base import (
     EmitEvent,
     ModelCatalog,
     ModelCatalogCache,
+    ModelCatalogStore,
     ProviderError,
     empty_output_error,
     humanize_model_id,
 )
 from .process import terminate_process
 
+logger = logging.getLogger(__name__)
+
+#: Joins a model slug to the reasoning effort it is pinned to: `gpt-5.5@high`.
+#: Codex slugs never contain it, while a `-high` suffix would be ambiguous with
+#: slugs such as `gpt-5.1-codex-max`.
+EFFORT_SEPARATOR = "@"
+
+# The value is spliced into a TOML `--config` override, and Codex accepts any
+# string there without complaint, so anything else is not a level at all.
+_EFFORT_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
+_EFFORT_LABELS = {
+    "none": "None",
+    "minimal": "Minimal",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+    "max": "Max",
+    "ultra": "Ultra",
+}
+
+
+def split_reasoning_effort(model: str) -> tuple[str, str]:
+    """Split `slug@effort` into its parts; a bare slug carries no effort."""
+    slug, separator, effort = model.rpartition(EFFORT_SEPARATOR)
+    if not separator or not slug or not _EFFORT_PATTERN.fullmatch(effort):
+        return model, ""
+    return slug, effort
+
+
+def _effort_label(effort: str) -> str:
+    return _EFFORT_LABELS.get(effort) or effort.replace("_", " ").title()
+
+
+def humanize_codex_model(model: str) -> str:
+    """Label for a Codex model id the CLI has not named, effort included."""
+    slug, effort = split_reasoning_effort(model)
+    label = humanize_model_id(slug)
+    return f"{label} ({_effort_label(effort)})" if effort else label
+
+
+def _reasoning_variants(slug: str, label: str, item: dict[str, object]) -> ModelCatalog:
+    """One catalog entry per reasoning effort the model supports.
+
+    Codex takes the effort as a separate setting rather than as part of the
+    model id, so the picker would otherwise offer each model once, at whatever
+    effort the server's `~/.codex/config.toml` last saved. Expanding them here
+    gives the same one-list choice the Antigravity ids already encode, with no
+    new field for the protocol or the client to carry.
+
+    The bare slug stays first and keeps meaning "no override": conversations
+    created before the expansion keep behaving exactly as they did.
+    """
+    levels = item.get("supported_reasoning_levels")
+    efforts: list[str] = []
+    for level in levels if isinstance(levels, list) else ():
+        effort = level.get("effort") if isinstance(level, dict) else level
+        if (
+            isinstance(effort, str)
+            and _EFFORT_PATTERN.fullmatch(effort)
+            and effort not in efforts
+        ):
+            efforts.append(effort)
+    if not efforts:
+        return ((slug, label),)
+    return ((slug, f"{label} (Default)"),) + tuple(
+        (f"{slug}{EFFORT_SEPARATOR}{effort}", f"{label} ({_effort_label(effort)})")
+        for effort in efforts
+    )
+
 
 def fetch_codex_models(command: str = "codex") -> ModelCatalog:
-    """Read the (model slug, display name) pairs exposed by the Codex CLI."""
+    """Read the (model id, display name) pairs exposed by the Codex CLI.
+
+    Every reasoning effort a model supports becomes an entry of its own; see
+    `_reasoning_variants`.
+    """
     try:
+        # Usually instant from the CLI's local cache, but when that expires the
+        # CLI refetches over the network first and takes several seconds. This
+        # runs in a worker thread, off every request path, so there is no reason
+        # to give up before it answers.
         res = subprocess.run(
             [command, "debug", "models"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=10,
         )
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
@@ -51,7 +133,7 @@ def fetch_codex_models(command: str = "codex") -> ModelCatalog:
                         or item.get("name")
                         or humanize_model_id(slug)
                     )
-                    models.append((slug, str(label)))
+                    models.extend(_reasoning_variants(slug, str(label), item))
             if models:
                 return tuple(models)
     except Exception:
@@ -67,7 +149,7 @@ class CodexCliProvider(AgentProvider):
     tone = "codex"
     _REASONING_SUMMARIES = frozenset({"auto", "concise", "detailed", "none"})
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store: ModelCatalogStore | None = None):
         self.settings = settings
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._interrupted: set[int] = set()
@@ -75,6 +157,7 @@ class CodexCliProvider(AgentProvider):
             self.id,
             fetch=lambda: fetch_codex_models(self.settings.codex_command),
             fallback=lambda: self.settings.codex_models,
+            store=store,
         )
 
     @property
@@ -97,15 +180,27 @@ class CodexCliProvider(AgentProvider):
 
     def model_display_name(self, model: str) -> str:
         if self._models_are_pinned:
-            return humanize_model_id(model)
+            return humanize_codex_model(model)
         return self._catalog.display_name(model)
 
     def validate_model(self, model: str) -> str:
         if not self.models:
             raise ProviderError(f"Provider {self.id} has no configured models")
-        if not model or model == "auto" or model not in self.models:
+        if not model or model == "auto":
             return self.models[0]
-        return model
+        if model in self.models:
+            return model
+        slug, effort = split_reasoning_effort(model)
+        if effort and slug in self.models:
+            # The model is still offered, only not at this level: answer with
+            # the same model at its default effort rather than another model.
+            logger.warning(
+                "Reasoning effort %r is not offered for %s; using its default",
+                effort,
+                slug,
+            )
+            return slug
+        return self.models[0]
 
     @property
     def available(self) -> bool:
@@ -130,26 +225,32 @@ class CodexCliProvider(AgentProvider):
             sandbox = "workspace-write"
         return ["--sandbox", sandbox]
 
-    def _reasoning_args(self) -> list[str]:
+    def _reasoning_args(self, effort: str = "") -> list[str]:
         summary = self.settings.codex_reasoning_summary
         if summary not in self._REASONING_SUMMARIES:
             summary = "detailed"
         # `hide_agent_reasoning` is a user-level Codex preference. OrbitPane has
         # an explicit, access-controlled execution timeline, so ensure summary
         # events reach the JSONL stream even if the interactive CLI hides them.
-        return [
+        args = [
             "--config",
             f'model_reasoning_summary="{summary}"',
             "--config",
             "hide_agent_reasoning=false",
         ]
+        # Without an explicit effort Codex falls back to `model_reasoning_effort`
+        # in config.toml — which its TUI rewrites whenever someone picks a level
+        # there — and only then to the model's own default.
+        if effort:
+            args.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        return args
 
     async def run(self, request: AgentRequest, emit: EmitEvent) -> AgentResult:
         if not self.available:
             raise ProviderError(
                 "Codex provider is disabled or not configured; set CODEX_ENABLED=true"
             )
-        model = self.validate_model(request.model)
+        slug, effort = split_reasoning_effort(self.validate_model(request.model))
         prompt = self._build_prompt(request)
         command = [
             self.settings.codex_command,
@@ -158,9 +259,9 @@ class CodexCliProvider(AgentProvider):
             "--ephemeral",
             "--skip-git-repo-check",
             "--model",
-            model,
+            slug,
         ]
-        command.extend(self._reasoning_args())
+        command.extend(self._reasoning_args(effort))
         command.extend(self._permission_args(request.permission_mode))
         command.append(prompt)
         process = await asyncio.create_subprocess_exec(

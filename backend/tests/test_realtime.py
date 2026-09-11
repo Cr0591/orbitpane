@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
@@ -56,8 +57,8 @@ class FakeWebSocket:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    async def send_json(self, message: dict[str, object]) -> None:
-        self.messages.append(message)
+    async def send_text(self, text: str) -> None:
+        self.messages.append(json.loads(text))
 
 
 class AgentCoordinatorTests(IsolatedAsyncioTestCase):
@@ -182,7 +183,9 @@ class AgentCoordinatorTests(IsolatedAsyncioTestCase):
             )
             queued_catalog = [
                 item
-                for item in coordinator.task_catalog(conversation_id=conversation.id)
+                for item in await coordinator.task_catalog(
+                    conversation_id=conversation.id
+                )
                 if item["status"] == "queued"
             ]
             self.assertEqual(queued_catalog[0]["position"], 1)
@@ -236,7 +239,7 @@ class AgentCoordinatorTests(IsolatedAsyncioTestCase):
                 database.list_runs(conversation_id=conversation.id), []
             )
             self.assertEqual(
-                coordinator.task_catalog(conversation_id=conversation.id), []
+                await coordinator.task_catalog(conversation_id=conversation.id), []
             )
             self.assertTrue(
                 any(

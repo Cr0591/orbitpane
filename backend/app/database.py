@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,6 +131,14 @@ class Database:
                     context_chars INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
+
+                -- The last model list each agent CLI reported, so a restart
+                -- serves it immediately instead of waiting on a fresh probe.
+                CREATE TABLE IF NOT EXISTS model_catalogs (
+                    provider TEXT PRIMARY KEY,
+                    models TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 );
                 """
             )
@@ -866,3 +875,42 @@ class Database:
     def delete_share_by_id(self, share_id: int) -> None:
         with self.connect() as connection:
             connection.execute("DELETE FROM shares WHERE id = ?", (share_id,))
+
+    def load_model_catalog(self, provider: str) -> tuple[tuple[str, str], ...]:
+        """The (model id, display name) pairs last saved for a provider."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT models FROM model_catalogs WHERE provider = ?", (provider,)
+            ).fetchone()
+        if row is None:
+            return ()
+        try:
+            entries = json.loads(row["models"])
+        except (TypeError, ValueError):
+            return ()
+        # Written by this process, but read back on a later start by whatever
+        # version is running then: anything unexpected is simply not a list.
+        if not isinstance(entries, list):
+            return ()
+        return tuple(
+            (entry[0], entry[1])
+            for entry in entries
+            if isinstance(entry, list)
+            and len(entry) == 2
+            and all(isinstance(part, str) and part for part in entry)
+        )
+
+    def save_model_catalog(
+        self, provider: str, catalog: tuple[tuple[str, str], ...]
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO model_catalogs(provider, models, fetched_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET "
+                "models = excluded.models, fetched_at = excluded.fetched_at",
+                (
+                    provider,
+                    json.dumps([list(entry) for entry in catalog], ensure_ascii=False),
+                    _utc_iso(),
+                ),
+            )

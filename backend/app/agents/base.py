@@ -6,6 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from ..models import Message
 
@@ -155,6 +156,14 @@ MODEL_CACHE_TTL_SECONDS = 300
 ModelCatalog = tuple[tuple[str, str], ...]
 
 
+class ModelCatalogStore(Protocol):
+    """Where the last successful probe of each provider survives a restart."""
+
+    def load_model_catalog(self, provider: str) -> ModelCatalog: ...
+
+    def save_model_catalog(self, provider: str, catalog: ModelCatalog) -> None: ...
+
+
 class ModelCatalogCache:
     """A provider's model list, refreshed without ever blocking the event loop.
 
@@ -168,9 +177,13 @@ class ModelCatalogCache:
 
     So the request path only ever reads a snapshot, and refreshing is an
     awaitable that runs the probe in a worker thread. A stale list is served
-    while a single background refresh replaces it, which means only the very
-    first read after a restart can wait at all — and `prewarm` usually spends
-    even that before a client connects.
+    while a single background refresh replaces it.
+
+    The first read after a restart used to be the exception: it had nothing to
+    serve, so `/api/agents` and every `/api/models` sat on a probe that takes
+    seconds — exactly when a client reconnects after a deploy. With a `store`,
+    the last successful probe is remembered across restarts and served as stale
+    at once, so only an installation that has never completed a probe waits.
     """
 
     def __init__(
@@ -179,13 +192,16 @@ class ModelCatalogCache:
         fetch: Callable[[], ModelCatalog],
         fallback: Callable[[], tuple[str, ...]],
         ttl_seconds: float = MODEL_CACHE_TTL_SECONDS,
+        store: ModelCatalogStore | None = None,
     ) -> None:
         self._label = label
         self._fetch = fetch
         self._fallback = fallback
         self._ttl_seconds = ttl_seconds
+        self._store = store
         self._models: tuple[str, ...] | None = None
         self._labels: dict[str, str] = {}
+        self._catalog: ModelCatalog = ()
         self._fetched_at = 0.0
         self._lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -200,7 +216,7 @@ class ModelCatalogCache:
 
     @property
     def has_probed(self) -> bool:
-        """Whether a discovery attempt has completed at least once."""
+        """Whether a discovery attempt has completed, here or before a restart."""
         return self._models is not None
 
     @property
@@ -213,15 +229,35 @@ class ModelCatalogCache:
     async def ensure_fresh(self) -> None:
         """Bring the cache up to date without stalling this request.
 
-        Only a cache that has never been filled makes the caller wait, and even
-        then it waits on a worker thread rather than on the event loop.
+        Only a cache that has never been filled — in this process or, through
+        the store, in an earlier one — makes the caller wait, and even then it
+        waits on a worker thread rather than on the event loop.
         """
         if not self.is_stale:
             return
         if self._models is None:
+            await self._restore()
+        if self._models is None:
             await self._refresh()
             return
         self._schedule_refresh()
+
+    async def _restore(self) -> None:
+        if self._store is None:
+            return
+        async with self._lock:
+            if self._models is not None:
+                return
+            try:
+                remembered = await asyncio.to_thread(
+                    self._store.load_model_catalog, self._label
+                )
+            except Exception:
+                logger.exception("Could not read the remembered %s models", self._label)
+                return
+            if remembered:
+                # Timestamp left at zero: served at once, confirmed by a probe.
+                self._set_catalog(remembered)
 
     def _schedule_refresh(self) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
@@ -244,12 +280,24 @@ class ModelCatalogCache:
             except Exception:
                 logger.exception("Model discovery failed for %s", self._label)
                 fetched = ()
+            changed = bool(fetched) and fetched != self._catalog
             self._apply(fetched)
+            if changed and self._store is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._store.save_model_catalog, self._label, fetched
+                    )
+                except Exception:
+                    logger.exception("Could not remember the %s models", self._label)
+
+    def _set_catalog(self, catalog: ModelCatalog) -> None:
+        self._catalog = catalog
+        self._labels = {model: label for model, label in catalog}
+        self._models = tuple(model for model, _ in catalog)
 
     def _apply(self, fetched: ModelCatalog) -> None:
         if fetched:
-            self._labels = {model: label for model, label in fetched}
-            self._models = tuple(model for model, _ in fetched)
+            self._set_catalog(fetched)
         elif self._models is None:
             self._models = self._fallback()
         # A failed probe keeps whatever was already being served rather than

@@ -21,6 +21,7 @@ from .base import (
     EmitEvent,
     ModelCatalog,
     ModelCatalogCache,
+    ModelCatalogStore,
     ProviderError,
     empty_output_error,
     humanize_model_id,
@@ -72,7 +73,7 @@ class AntigravityProvider(AgentProvider):
         "gemini-3.1-pro-high": "gemini-3.1-pro-low",
     }
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store: ModelCatalogStore | None = None):
         self.settings = settings
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._interrupted: set[int] = set()
@@ -83,6 +84,7 @@ class AntigravityProvider(AgentProvider):
             # stands in for it.
             fetch=lambda: fetch_antigravity_models(self.settings.antigravity_command),
             fallback=lambda: self.settings.antigravity_models,
+            store=store,
         )
 
     @property

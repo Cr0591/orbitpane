@@ -38,13 +38,19 @@ export async function apiFetch<T>(
 
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), 15_000)
+  // A caller's signal cancels the request too, without replacing the timeout.
+  // (`AbortSignal.any` would say this in one line, but not on older Safari.)
+  const callerSignal = init.signal
+  const abortFromCaller = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', abortFromCaller, { once: true })
   try {
     const response = await fetch(path, {
       ...init,
       headers,
       credentials: 'include',
       cache: init.cache ?? 'no-store',
-      signal: init.signal ?? controller.signal,
+      signal: controller.signal,
     })
     if (response.status === 401) notifyAuthExpired()
 
@@ -58,5 +64,6 @@ export async function apiFetch<T>(
     return payload as T
   } finally {
     window.clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', abortFromCaller)
   }
 }
