@@ -47,6 +47,26 @@ class ApplicationTests(IsolatedAsyncioTestCase):
         self.assertIn("orbitpane_session", response.cookies)
         return {}
 
+    async def test_history_and_search_pagination_require_auth_and_preserve_legacy_history(self) -> None:
+        database = self.app.state.database
+        conversation = database.create_conversation("Pages", str(self.workspace), "antigravity")
+        for i in range(5):
+            database.add_message(conversation.id, "user", f"pagination needle {i}")
+        url = f"/api/history/{conversation.id}"
+        self.assertEqual((await self.client.get(url + "?limit=2")).status_code, 401)
+        self.assertEqual((await self.client.get("/api/search?q=needle&offset=2")).status_code, 401)
+        await self.login_headers()
+        first = (await self.client.get(url + "?limit=2")).json()
+        self.assertEqual(len(first["items"]), 2)
+        self.assertTrue(first["has_more"])
+        older = (await self.client.get(url, params={"limit": 2, "before_id": first["items"][0]["id"]})).json()
+        self.assertLess(older["items"][-1]["id"], first["items"][0]["id"])
+        self.assertEqual(len((await self.client.get(url)).json()), 5)
+        self.assertEqual((await self.client.get(url + "?limit=2&before_id=3&after_id=1")).status_code, 422)
+        search = (await self.client.get("/api/search?q=needle&limit=2&offset=4")).json()
+        self.assertEqual(len(search["items"]), 1)
+        self.assertFalse(search["has_more"])
+
     async def test_slow_model_discovery_does_not_stall_the_event_loop(self) -> None:
         """A cold start must not hang behind the agent CLI.
 

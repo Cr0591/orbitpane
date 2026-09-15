@@ -375,6 +375,34 @@ class Database:
             ).fetchall()
         return [self._message(row) for row in rows]
 
+    def message_page(
+        self, conversation_id: int, limit: int = 60, *,
+        before_id: int | None = None, after_id: int | None = None,
+    ) -> tuple[list[Message], bool, int]:
+        clauses = ["conversation_id = ?"]
+        params: list[object] = [conversation_id]
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        if after_id is not None:
+            clauses.append("id > ?")
+            params.append(after_id)
+        order = "ASC" if after_id is not None else "DESC"
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY id {order} LIMIT ?",
+                [*params, limit + 1],
+            ).fetchall()
+            first_id = connection.execute(
+                "SELECT COALESCE(MIN(id), 0) FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0]
+        more = len(rows) > limit
+        rows = rows[:limit]
+        if after_id is None:
+            rows.reverse()
+        return [self._message(row) for row in rows], more, int(first_id)
+
     def max_message_id(self, conversation_id: int) -> int:
         with self.connect() as connection:
             row = connection.execute(
@@ -607,6 +635,15 @@ class Database:
                 ),
             )
 
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT r.*, c.name AS conversation_name FROM runs r "
+                "JOIN conversations c ON c.id = r.conversation_id WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return {**dict(row), "is_summary": bool(row["is_summary"])} if row else None
+
     def update_run(self, run_id: str, **values: object) -> None:
         allowed = {
             "status",
@@ -660,21 +697,21 @@ class Database:
             for row in rows
         ]
 
-    def search(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
-        pattern = f"%{query.casefold()}%"
+    def search(self, query: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        pattern = "%" + query.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT 'conversation' AS result_type, c.id AS conversation_id, "
                 "NULL AS message_id, c.name AS title, c.path AS snippet, c.created_at "
                 "FROM conversations c WHERE c.is_archived = 0 AND "
-                "(lower(c.name) LIKE ? OR lower(c.path) LIKE ?) "
+                "(lower(c.name) LIKE ? ESCAPE '\\' OR lower(c.path) LIKE ? ESCAPE '\\') "
                 "UNION ALL "
                 "SELECT 'message' AS result_type, m.conversation_id, m.id AS message_id, "
-                "c.name AS title, substr(m.content, 1, 280) AS snippet, m.timestamp AS created_at "
+                "c.name AS title, substr(m.content, MAX(1, instr(lower(m.content), lower(?)) - 90), 280) AS snippet, m.timestamp AS created_at "
                 "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
-                "WHERE c.is_archived = 0 AND lower(m.content) LIKE ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (pattern, pattern, pattern, limit),
+                "WHERE c.is_archived = 0 AND lower(m.content) LIKE ? ESCAPE '\\' "
+                "ORDER BY created_at DESC, conversation_id DESC, message_id DESC LIMIT ? OFFSET ?",
+                (pattern, pattern, query, pattern, limit, offset),
             ).fetchall()
         return [
             {

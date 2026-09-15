@@ -1,8 +1,8 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Square, Send, AtSign, ListPlus, Plus } from 'lucide-react'
 import { ModelSelector } from './ModelSelector'
 import { FileMentionPicker } from './FileMentionPicker'
-import { apiFetch } from '../lib/api'
+import { apiFetch, describeApiError } from '../lib/api'
 import { haptic } from '../lib/nativeFeedback'
 import { useEscapeLayer } from '../hooks/useEscapeLayer'
 import { REFERENCE_FILE_EVENT } from '../lib/appEvents'
@@ -39,7 +39,6 @@ interface ChatInputProps {
   handleKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void
   sendMessage: () => void
   isAgentThinking: boolean
-  isConnected: boolean
   textareaRef: React.RefObject<HTMLTextAreaElement | null>
   isNearBottom: () => boolean
   scrollToBottom: (smooth: boolean) => void
@@ -48,7 +47,6 @@ interface ChatInputProps {
   models: ModelOption[]
   loadModels: () => void
   socketRef: React.MutableRefObject<WebSocket | null>
-  connectWebSocket: (conv: Conversation, isManual?: boolean) => void
   showToast: (msg: string, kind?: ToastKind) => void
   setIsDrawerOpen: (open: boolean) => void
 }
@@ -61,7 +59,6 @@ export function ChatInput({
   handleKeyDown,
   sendMessage,
   isAgentThinking,
-  isConnected,
   textareaRef,
   isNearBottom,
   scrollToBottom,
@@ -70,7 +67,6 @@ export function ChatInput({
   models,
   loadModels,
   socketRef,
-  connectWebSocket,
   showToast,
   setIsDrawerOpen
 }: ChatInputProps) {
@@ -83,6 +79,9 @@ export function ChatInput({
   const [recentFiles, setRecentFiles] = useState<FileSearchItem[]>([])
   const [activeFileIndex, setActiveFileIndex] = useState(0)
   const [isFileSearchLoading, setIsFileSearchLoading] = useState(false)
+  const [fileSearchError, setFileSearchError] = useState('')
+  const [fileSearchTruncated, setFileSearchTruncated] = useState(false)
+  const [fileSearchAttempt, setFileSearchAttempt] = useState(0)
 
   const visibleFileResults = mention && !mention.query && recentFiles.length > 0
     ? recentFiles
@@ -92,12 +91,23 @@ export function ChatInput({
   // the drawer or any other overlay behind the composer.
   useEscapeLayer(mention !== null, () => setMention(null))
 
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    const viewportHeight = window.visualViewport?.height ?? window.innerHeight
+    textarea.style.height = 'auto'
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 400, viewportHeight * 0.35)}px`
+  }, [textareaRef])
+
+  useLayoutEffect(resizeTextarea, [input, resizeTextarea])
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 400)}px`
+    window.addEventListener('resize', resizeTextarea)
+    window.visualViewport?.addEventListener('resize', resizeTextarea)
+    return () => {
+      window.removeEventListener('resize', resizeTextarea)
+      window.visualViewport?.removeEventListener('resize', resizeTextarea)
     }
-  }, [input, textareaRef])
+  }, [resizeTextarea])
 
   useEffect(() => {
     setMention(null)
@@ -120,6 +130,9 @@ export function ChatInput({
     // newer one overtook while it was queued.)
     const controller = new AbortController()
     setIsFileSearchLoading(true)
+    setFileSearchError('')
+    setFileSearchTruncated(false)
+    setFileResults([])
     const timeout = window.setTimeout(() => {
       apiFetch<FileSearchResponse>(
         `/api/conversations/${activeConversationId}/files?q=${encodeURIComponent(mention.query)}&limit=50`,
@@ -128,11 +141,13 @@ export function ChatInput({
         .then(data => {
           if (requestId !== searchRequestRef.current) return
           setFileResults(data.items)
+          setFileSearchTruncated(data.truncated)
           setActiveFileIndex(0)
         })
         .catch(error => {
           if (requestId !== searchRequestRef.current) return
-          console.error(error)
+          if (controller.signal.aborted) return
+          setFileSearchError(describeApiError(error, '文件搜索失败'))
           setFileResults([])
         })
         .finally(() => {
@@ -145,7 +160,7 @@ export function ChatInput({
       searchRequestRef.current += 1
       controller.abort()
     }
-  }, [activeConversationId, mention])
+  }, [activeConversationId, mention, fileSearchAttempt])
 
   useEffect(() => {
     const handlePointerDown = (event: PointerEvent) => {
@@ -206,10 +221,6 @@ export function ChatInput({
     if (input.trim()) {
       haptic('success')
       sendMessage()
-      if (!isConnected) {
-        showToast('消息已保存，连接恢复后自动发送', 'info')
-        connectWebSocket(activeConv, true)
-      }
     }
   }
 
@@ -239,8 +250,11 @@ export function ChatInput({
       >
         {mention && activeConv && (
           <FileMentionPicker
+            error={fileSearchError}
+            truncated={fileSearchTruncated}
+            onRetry={() => setFileSearchAttempt(value => value + 1)}
             items={visibleFileResults}
-            loading={isFileSearchLoading && visibleFileResults.length === 0}
+            loading={isFileSearchLoading}
             query={mention.query}
             activeIndex={activeFileIndex}
             workspacePath={activeConv.path}

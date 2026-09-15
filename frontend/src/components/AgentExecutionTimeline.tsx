@@ -1,8 +1,25 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ChevronDown, ChevronRight, Play, Terminal, FileEdit, Search, ListTodo, Brain, Check, Activity } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Play,
+  Terminal,
+  FileEdit,
+  Search,
+  ListTodo,
+  Brain,
+  Check,
+  Activity,
+  AlertTriangle,
+  AlertCircle,
+  Clock,
+  Square,
+} from 'lucide-react'
 import MarkdownContent from './MarkdownContent'
 import { asText } from '../lib/normalize'
+import { REQUEST_INTERRUPT_EVENT } from '../lib/appEvents'
+import type { HealthStatus } from '../lib/types'
 import './AgentExecutionTimeline.css'
 
 interface AgentExecutionTimelineProps {
@@ -10,6 +27,9 @@ interface AgentExecutionTimelineProps {
   isThinking: boolean
   duration?: number
   elapsedSoFar?: number
+  inactiveSeconds?: number
+  healthStatus?: HealthStatus
+  statusMessage?: string
 }
 
 type StepType = 'exec' | 'tool' | 'search' | 'file' | 'plan' | 'thought' | 'other'
@@ -26,7 +46,10 @@ export function AgentExecutionTimeline({
   thought, 
   isThinking, 
   duration, 
-  elapsedSoFar = 0 
+  elapsedSoFar = 0,
+  inactiveSeconds,
+  healthStatus,
+  statusMessage,
 }: AgentExecutionTimelineProps) {
   const [isOpen, setIsOpen] = useState<boolean>(isThinking)
   const [filter, setFilter] = useState<'all' | 'actions' | 'thoughts'>('all')
@@ -147,18 +170,32 @@ export function AgentExecutionTimeline({
       >
         <div className="header-left">
           {isThinking ? (
-            <span className="execution-icon active">
-              <Activity size={14} className="icon-pulse" />
-            </span>
+            healthStatus === 'retrying' ? (
+              <span className="execution-icon retrying" title="模型接口繁忙重试中">
+                <AlertTriangle size={14} className="icon-pulse" />
+              </span>
+            ) : healthStatus === 'stalled' ? (
+              <span className="execution-icon stalled" title="任务长时间无响应">
+                <AlertCircle size={14} className="icon-pulse" />
+              </span>
+            ) : (
+              <span className="execution-icon active">
+                <Activity size={14} className="icon-pulse" />
+              </span>
+            )
           ) : (
             <span className="execution-icon done">
               <Brain size={14} />
             </span>
           )}
           
-          <span className="execution-title">
+          <span className={`execution-title ${isThinking && healthStatus ? healthStatus : ''}`}>
             {isThinking 
-              ? '思考与工具调用中…' 
+              ? (healthStatus === 'retrying'
+                  ? (statusMessage || '模型服务繁忙，重试中…')
+                  : healthStatus === 'stalled'
+                    ? '长时间无输出（疑似卡住）'
+                    : '思考与工具调用中…')
               : steps.length > 0 
                 ? `已完成思考与工具调用` 
                 : '思考过程'
@@ -174,6 +211,15 @@ export function AgentExecutionTimeline({
         </div>
 
         <div className="header-right">
+          {isThinking && healthStatus === 'retrying' && (
+            <span className="step-status-badge retrying">重试中</span>
+          )}
+          {isThinking && healthStatus === 'stalled' && (
+            <span className="step-status-badge stalled">疑似卡住</span>
+          )}
+          {isThinking && healthStatus === 'slow' && (
+            <span className="step-status-badge slow">耗时较长</span>
+          )}
           {steps.length > 0 && !isThinking && (
             <span className="step-count-badge">
               {steps.length} 个步骤
@@ -277,6 +323,70 @@ export function AgentExecutionTimeline({
                 <div className="thinking-placeholder">
                   思考过程已完成。
                 </div>
+              )}
+
+              {isThinking && (
+                <>
+                  {healthStatus === 'retrying' && (
+                    <div className="timeline-health-banner retrying" role="status">
+                      <AlertTriangle size={15} className="health-banner-icon" />
+                      <div className="health-banner-content">
+                        <div className="health-banner-title">模型接口繁忙，正在自动重试</div>
+                        <div className="health-banner-desc">
+                          {statusMessage || '后台检测到模型服务暂时限流或繁忙（503），系统正在自动退避重试，无需刷新页面。'}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {healthStatus === 'stalled' && (
+                    <div className="timeline-health-banner stalled" role="alert">
+                      <AlertCircle size={16} className="health-banner-icon" />
+                      <div className="health-banner-content">
+                        <div className="health-banner-title">
+                          已超过 {formatDuration(inactiveSeconds ?? 120)} 无新输出，任务疑似卡住
+                        </div>
+                        <div className="health-banner-desc">
+                          后台进程较长时间未产生新步骤或日志。可能是命令正处于无输出的长时间运行、交互阻塞或网络等待；若您确信任务仍在正常计算可继续等待，或者可直接中断。
+                        </div>
+                        <div className="health-banner-actions">
+                          <button
+                            type="button"
+                            className="health-interrupt-btn"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              window.dispatchEvent(new CustomEvent(REQUEST_INTERRUPT_EVENT))
+                            }}
+                          >
+                            <Square size={12} fill="currentColor" />
+                            <span>中断当前任务</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {healthStatus === 'slow' && (
+                    <div className="timeline-health-banner slow" role="status">
+                      <Clock size={14} className="health-banner-icon" />
+                      <div className="health-banner-content">
+                        <div className="health-banner-desc">
+                          当前步骤已持续 {formatDuration(inactiveSeconds ?? 45)} 无新输出，后台正在处理耗时较长的操作...
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {steps.length > 0 && (
+                    <div className="timeline-activity-footer">
+                      <span>已执行 {steps.length} 个步骤</span>
+                      <span className="activity-dot">·</span>
+                      <span>
+                        最近活动：{inactiveSeconds && inactiveSeconds >= 1 ? `${Math.round(inactiveSeconds)} 秒前` : '刚刚'}
+                      </span>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </motion.div>

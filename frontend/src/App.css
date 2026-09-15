@@ -3233,3 +3233,13 @@
   color: var(--text-tertiary);
   gap: var(--space-4);
 }
+
+/* Virtual rows own their measured height; nested intrinsic estimates would
+   otherwise make the placeholder and the rendered row disagree. */
+.virtual-message { width: 100%; flex-shrink: 0; display: flow-root; }
+.virtual-message .message-row { content-visibility: visible; contain-intrinsic-size: none; }
+.history-sync-status { display: flex; gap: 12px; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 13px; }
+.history-sync-status button, .history-load-older { cursor: pointer; color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 12px; }
+.history-load-older { align-self: center; }
+.file-mention-status { padding: 12px; font-size: 13px; color: var(--text-secondary); }
+.cmd-search-snippet mark { background: #f4cd5870; color: inherit; border-radius: 2px; }

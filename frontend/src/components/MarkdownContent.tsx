@@ -12,6 +12,7 @@ import { Maximize2, X } from 'lucide-react'
 interface MarkdownContentProps {
   content: string
   enableCodeBlocks?: boolean
+  isStreaming?: boolean
 }
 
 /**
@@ -84,14 +85,27 @@ const CODE_COMPONENTS = { table: ResponsiveTable, code: CodeBlock }
 function MarkdownContent({
   content,
   enableCodeBlocks = false,
+  isStreaming = false,
 }: MarkdownContentProps) {
-  const processedContent = React.useMemo(() => fixMarkdownTables(content), [content])
+  const latestContent = React.useRef(content)
+  const [streamContent, setStreamContent] = React.useState(content)
+  React.useEffect(() => { latestContent.current = content }, [content])
+  React.useEffect(() => {
+    if (!isStreaming) return
+    const timer = window.setInterval(() => setStreamContent(latestContent.current), 150)
+    return () => window.clearInterval(timer)
+  }, [isStreaming])
+  // Preserve one Markdown document (references, fences, tables and maths can
+  // cross paragraph boundaries). Limit parsing during streaming, then display
+  // the complete final document immediately and enable syntax highlighting.
+  const displayedContent = isStreaming ? streamContent : content
+  const processedContent = React.useMemo(() => fixMarkdownTables(displayedContent), [displayedContent])
 
   return (
     <ReactMarkdown
       remarkPlugins={REMARK_PLUGINS}
       rehypePlugins={REHYPE_PLUGINS}
-      components={enableCodeBlocks ? CODE_COMPONENTS : PROSE_COMPONENTS}
+      components={enableCodeBlocks && !isStreaming ? CODE_COMPONENTS : PROSE_COMPONENTS}
     >
       {processedContent}
     </ReactMarkdown>

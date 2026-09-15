@@ -659,9 +659,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/history/{conversation_id}",
         dependencies=[Depends(require_auth)],
     )
-    def get_history(conversation_id: int):
+    def get_history(
+        conversation_id: int,
+        limit: int | None = Query(default=None, ge=1, le=200),
+        before_id: int | None = Query(default=None, ge=1),
+        after_id: int | None = Query(default=None, ge=0),
+    ):
         if database.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        if before_id is not None and after_id is not None:
+            raise HTTPException(status_code=422, detail="Use only one history cursor")
+        if limit is not None:
+            items, more, first_id = database.message_page(
+                conversation_id, limit, before_id=before_id, after_id=after_id,
+            )
+            return {"items": [asdict(item) for item in items], "has_more": more, "first_id": first_id}
         return [asdict(item) for item in database.list_messages(conversation_id)]
 
     @app.delete(
@@ -853,11 +865,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def search(
         q: str = Query(min_length=1, max_length=256),
         limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
     ):
         query = q.strip()
         if not query:
             raise HTTPException(status_code=422, detail="Search query is required")
-        return {"items": database.search(query, limit)}
+        items = database.search(query, limit + 1, offset)
+        return {"items": items[:limit], "has_more": len(items) > limit}
 
     @app.get("/api/tasks", dependencies=[Depends(require_auth)])
     async def list_tasks(limit: int = Query(default=100, ge=1, le=200)):
@@ -1084,12 +1098,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         content=chat_message.content.strip(),
                         model=chat_message.model,
                         provider_id=chat_message.provider,
+                        request_id=chat_message.request_id,
                     )
                     await hub.send(
                         websocket,
                         conversation_id,
                         {
                             "type": "submitted",
+                            "request_id": chat_message.request_id,
                             "conversation_id": conversation_id,
                             "task": submitted,
                         },
@@ -1102,6 +1118,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "type": "error",
                             "conversation_id": conversation_id,
                             "code": "invalid_request",
+                            "request_id": raw_message.get("request_id"),
                             "content": str(exc),
                         },
                     )

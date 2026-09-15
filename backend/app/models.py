@@ -64,6 +64,7 @@ class ConversationUpdate(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     content: str = Field(min_length=1, max_length=200_000)
     model: str | None = Field(default=None, max_length=120)
     provider: str | None = Field(default=None, max_length=40)

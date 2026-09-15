@@ -4,7 +4,7 @@ import {
   Search, Plus, Sun, Moon, RefreshCw, Square,
   Eraser, Download, HelpCircle, MessageSquare, Terminal, Keyboard, FileText, Loader2, Share2
 } from 'lucide-react'
-import { apiFetch } from '../lib/api'
+import { apiFetch, describeApiError } from '../lib/api'
 import { useFocusTrap } from '../hooks/useFocusTrap'
 import { useEscapeLayer } from '../hooks/useEscapeLayer'
 import { OPEN_SHARE_EVENT, REQUEST_INTERRUPT_EVENT } from '../lib/appEvents'
@@ -43,6 +43,11 @@ export function CommandPalette({
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
   const [isSearching, setIsSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [hasMore, setHasMore] = useState(false)
+  const [offset, setOffset] = useState(0)
+  const [searchAttempt, setSearchAttempt] = useState(0)
+  const searchGenerationRef = useRef(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const { checkForUpdate } = useUpdateCheck(showToast)
@@ -71,24 +76,38 @@ export function CommandPalette({
   }, [query])
 
   useEffect(() => {
+    const generation = ++searchGenerationRef.current
+    const controller = new AbortController()
     const trimmed = query.trim()
-    if (!trimmed) {
+    setSearchError('')
+    if (!isOpen || !trimmed) {
       setSearchResults([])
+      setHasMore(false)
       setIsSearching(false)
       return
     }
     setIsSearching(true)
     const timer = window.setTimeout(() => {
-      apiFetch<{ items: SearchResult[] }>(`/api/search?q=${encodeURIComponent(trimmed)}&limit=30`)
-        .then(data => setSearchResults(data.items))
-        .catch(error => {
-          console.error(error)
-          setSearchResults([])
-        })
-        .finally(() => setIsSearching(false))
-    }, 180)
-    return () => window.clearTimeout(timer)
-  }, [query])
+      apiFetch<{ items: SearchResult[]; has_more: boolean }>(
+        `/api/search?q=${encodeURIComponent(trimmed)}&limit=20&offset=${offset}`,
+        { signal: controller.signal },
+      ).then(data => {
+        if (generation !== searchGenerationRef.current) return
+        setSearchResults(previous => offset === 0 ? data.items : [...previous, ...data.items])
+        setHasMore(data.has_more)
+      }).catch(error => {
+        if (generation !== searchGenerationRef.current || controller.signal.aborted) return
+        setSearchError(describeApiError(error, '搜索失败'))
+      }).finally(() => {
+        if (generation === searchGenerationRef.current) setIsSearching(false)
+      })
+    }, offset ? 0 : 180)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+      searchGenerationRef.current += 1
+    }
+  }, [query, isOpen, offset, searchAttempt])
 
   useEffect(() => {
     if (!listRef.current) return
@@ -134,7 +153,7 @@ export function CommandPalette({
 
   const itemsCount = !query
     ? staticActions.length + filteredConvs.slice(0, 5).length
-    : searchResults.slice(0, 20).length
+    : searchResults.length
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Escape') {
@@ -188,7 +207,12 @@ export function CommandPalette({
               className="cmd-input"
               placeholder="搜索项目、消息或执行指令…"
               value={query}
-              onChange={e => setQuery(e.target.value)}
+              onChange={e => {
+                setQuery(e.target.value)
+                setOffset(0)
+                setSearchResults([])
+                setHasMore(false)
+              }}
               onKeyDown={handleKeyDown}
             />
             <kbd className="cmd-kbd">ESC</kbd>
@@ -297,7 +321,7 @@ export function CommandPalette({
                     {isSearching && (
                       <div className="cmd-searching"><Loader2 size={15} className="animate-spin" />搜索项目与消息…</div>
                     )}
-                    {!isSearching && searchResults.slice(0, 20).map((result, idx) => (
+                    {searchResults.map((result, idx) => (
                       <button
                         key={`${result.result_type}-${result.conversation_id}-${result.message_id || 0}`}
                         className={`cmd-item ${selectedIndex === idx ? 'active' : ''}`}
@@ -309,14 +333,19 @@ export function CommandPalette({
                           : <MessageSquare size={15} className="cmd-item-icon" />}
                         <div className="cmd-conv-text">
                           <div className="cmd-conv-name">{result.title}</div>
-                          <div className="cmd-search-snippet">{result.snippet}</div>
+                          <div className="cmd-search-snippet"><SearchSnippet text={result.snippet} query={query.trim()} /></div>
                         </div>
                       </button>
                     ))}
+                    {searchError && <div className="cmd-empty" role="status">{searchError}
+                      <button type="button" onClick={() => setSearchAttempt(value => value + 1)}>重试</button>
+                    </div>}
+                    {hasMore && !searchError && <button className="cmd-item" type="button" disabled={isSearching}
+                      onClick={() => setOffset(searchResults.length)}>{isSearching ? '正在加载…' : '加载更多结果'}</button>}
                   </div>
                 )}
 
-                {query && !isSearching && searchResults.length === 0 && (
+                {query && !isSearching && !searchError && searchResults.length === 0 && (
                   <div className="cmd-empty">
                     <Terminal size={24} style={{ opacity: 0.4, marginBottom: 8 }} />
                     <span>未找到匹配的项目、消息或指令</span>
@@ -329,4 +358,20 @@ export function CommandPalette({
       </div>
     </AnimatePresence>
   )
+}
+
+function SearchSnippet({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>
+  const parts: React.ReactNode[] = []
+  const lower = text.toLowerCase()
+  const needle = query.toLowerCase()
+  let cursor = 0
+  let match = lower.indexOf(needle)
+  while (match >= 0) {
+    parts.push(text.slice(cursor, match), <mark key={match}>{text.slice(match, match + query.length)}</mark>)
+    cursor = match + query.length
+    match = lower.indexOf(needle, cursor)
+  }
+  parts.push(text.slice(cursor))
+  return <>{parts}</>
 }

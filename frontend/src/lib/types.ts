@@ -19,7 +19,11 @@ export interface FileSearchResponse {
 
 export type MessageFeedback = 'up' | 'down' | ''
 
+export type HealthStatus = 'active' | 'retrying' | 'slow' | 'stalled'
+
 export interface Message {
+  request_id?: string
+  deliveryFailed?: boolean
   id?: number
   /**
    * Stable client-side identity, assigned when a message first appears.
@@ -39,6 +43,9 @@ export interface Message {
   thinkingDuration?: number
   duration?: number
   elapsedSoFar?: number
+  inactiveSeconds?: number
+  healthStatus?: HealthStatus
+  statusMessage?: string
   isError?: boolean
   /**
    * Server-assigned class of failure, e.g. `permission_required`.

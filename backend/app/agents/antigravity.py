@@ -5,6 +5,7 @@ import codecs
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -169,6 +170,7 @@ class AntigravityProvider(AgentProvider):
                 completed_responses,
             )
         )
+        log_task = asyncio.create_task(self._follow_log(log_path, emit))
         content_parts: list[str] = []
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         stopped_after_completion = False
@@ -278,6 +280,8 @@ class AntigravityProvider(AgentProvider):
                 await asyncio.gather(read_task, return_exceptions=True)
             transcript_task.cancel()
             await asyncio.gather(transcript_task, return_exceptions=True)
+            log_task.cancel()
+            await asyncio.gather(log_task, return_exceptions=True)
             if process.returncode is None:
                 await terminate_process(process)
             if not stderr_task.done():
@@ -387,3 +391,40 @@ class AntigravityProvider(AgentProvider):
                         completion_event.set()
                     elif has_tool_calls:
                         completion_event.clear()
+
+    @staticmethod
+    async def _follow_log(log_path: Path, emit: EmitEvent) -> None:
+        deadline = time.monotonic() + 30
+        while not log_path.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if not log_path.exists():
+            return
+
+        is_retrying = False
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        await asyncio.sleep(0.25)
+                        continue
+
+                    if "retrying in " in line:
+                        retry_match = re.search(r"retrying in ([0-9\.]+[a-z]*)", line)
+                        retry_delay = retry_match.group(1) if retry_match else "数秒"
+                        if "503" in line or "No capacity" in line:
+                            msg = f"模型服务繁忙 (503)，正在自动重试（等待 {retry_delay}）..."
+                        elif "429" in line or "ResourceExhausted" in line:
+                            msg = f"模型调用频率超限 (429)，正在自动重试（等待 {retry_delay}）..."
+                        else:
+                            msg = f"模型接口暂时不可用，正在自动重试（等待 {retry_delay}）..."
+                        is_retrying = True
+                        await emit(AgentEvent("status", msg))
+                    elif is_retrying and (
+                        "streamGenerateContent" in line
+                        or "Starting conversation" in line
+                    ):
+                        is_retrying = False
+                        await emit(AgentEvent("status", ""))
+        except asyncio.CancelledError:
+            return

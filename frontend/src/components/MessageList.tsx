@@ -8,10 +8,13 @@ import { haptic } from '../lib/nativeFeedback'
 import { messageKey } from '../lib/messageIdentity'
 import { OPEN_INSPECTOR_EVENT } from '../lib/appEvents'
 import { formatModelName } from '../lib/providers'
+import { VirtualMessage } from './VirtualMessage'
 import { MobileBottomSheet } from './MobileBottomSheet'
 
 interface MessageListProps {
   messages: Message[]
+  renderAll?: boolean
+  focusedMessageId?: number
   /** Stable key of the message whose copy button is showing its tick. */
   copiedMessageKey: string | null
   isAgentThinking: boolean
@@ -170,12 +173,15 @@ const MessageRow = React.memo(function MessageRow({
               isThinking={!!message.isThinking}
               duration={message.thinkingDuration ?? message.duration}
               elapsedSoFar={message.elapsedSoFar}
+              inactiveSeconds={message.inactiveSeconds}
+              healthStatus={message.healthStatus}
+              statusMessage={message.statusMessage}
             />
 
             {message.content ? (
               <div className="markdown-body">
                 <Suspense fallback={<div className="message-loading-placeholder">{message.content}</div>}>
-                  <MarkdownContent content={message.content} enableCodeBlocks />
+                  <MarkdownContent content={message.content} enableCodeBlocks isStreaming={!!message.isThinking} />
                 </Suspense>
               </div>
             ) : null}
@@ -235,6 +241,7 @@ const MessageRow = React.memo(function MessageRow({
         ) : (
           <div className="user-content-wrapper">
             <div className="user-text-content">{message.content}</div>
+            {message.deliveryFailed && <span role="status">发送失败，内容已保留；可复制后重新发送</span>}
             <button
               className="user-copy-btn"
               title="复制发送内容"
@@ -257,6 +264,8 @@ const MessageRow = React.memo(function MessageRow({
 
 export function MessageList({
   messages,
+  renderAll = false,
+  focusedMessageId,
   copiedMessageKey,
   isDrawerSwiping,
   copyMessageText,
@@ -296,8 +305,16 @@ export function MessageList({
     y: number
   } | null>(null)
   const isSummarizedSectionExpanded = (
-    latestSummaryKey !== null && expandedHistoryKey === latestSummaryKey
+    renderAll || (latestSummaryKey !== null && expandedHistoryKey === latestSummaryKey)
   )
+  const revealedMessageRef = React.useRef<number | undefined>(undefined)
+  React.useEffect(() => {
+    if (focusedMessageId === undefined || revealedMessageRef.current === focusedMessageId) return
+    const index = messages.findIndex(message => message.id === focusedMessageId)
+    if (index < 0) return
+    revealedMessageRef.current = focusedMessageId
+    if (index < latestSummaryIndex) setExpandedHistoryKey(latestSummaryKey)
+  }, [focusedMessageId, messages, latestSummaryIndex, latestSummaryKey])
   const summarizedMessageCount = latestSummaryIndex > 0
     ? messages.slice(0, latestSummaryIndex).filter(message => (
         message.role === 'user' || message.role === 'agent'
@@ -433,6 +450,7 @@ export function MessageList({
 
         const key = messageKey(m, i)
 
+        const renderMessage = () => {
         if (m.role === 'system') {
           if (m.isError) return <SystemErrorNotice key={key} message={m} />
           return (
@@ -448,7 +466,7 @@ export function MessageList({
           const isLatestSummary = i === latestSummaryIndex
           const isSummaryExpanded = isLatestSummary
             ? isSummarizedSectionExpanded
-            : expandedSummaryKey === key
+            : renderAll || expandedSummaryKey === key
           return (
             <motion.section
               key={key}
@@ -549,6 +567,12 @@ export function MessageList({
             onContextMenu={handleContextMenu}
           />
         )
+        }
+        return <VirtualMessage key={key} messageId={m.id}
+          initialVisible={i >= messages.length - 8}
+          forceVisible={renderAll || m.isThinking === true || (focusedMessageId !== undefined && m.id === focusedMessageId)}>
+          {renderMessage()}
+        </VirtualMessage>
       })}
       <MobileBottomSheet
         open={contextMessage !== null}

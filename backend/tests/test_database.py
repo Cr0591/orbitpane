@@ -16,6 +16,40 @@ class DatabaseTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_history_pages_and_incremental_cursor_are_scoped(self) -> None:
+        conversation = self.database.create_conversation("Pages", self.temp_dir.name, "fake")
+        other = self.database.create_conversation("Other", self.temp_dir.name, "fake")
+        ids = []
+        for i in range(8):
+            ids.append(self.database.add_message(conversation.id, "user", f"message {i}"))
+            self.database.add_message(other.id, "user", "private")
+        page, more, first = self.database.message_page(conversation.id, 3)
+        self.assertEqual([m.id for m in page], ids[-3:])
+        self.assertTrue(more)
+        self.assertEqual(first, ids[0])
+        older, more, _ = self.database.message_page(conversation.id, 3, before_id=page[0].id)
+        self.assertEqual([m.id for m in older], ids[2:5])
+        self.assertTrue(more)
+        delta, more, _ = self.database.message_page(conversation.id, 3, after_id=ids[4])
+        self.assertEqual([m.id for m in delta], ids[5:])
+        self.assertFalse(more)
+        self.database.clear_history(conversation.id)
+        self.assertEqual(self.database.message_page(conversation.id), ([], False, 0))
+
+    def test_search_excerpt_pagination_and_literal_wildcards(self) -> None:
+        conversation = self.database.create_conversation("Search", self.temp_dir.name, "fake")
+        for i in range(5):
+            self.database.add_message(conversation.id, "user", "prefix " * 100 + f"needle {i} 100% a_b")
+        first = self.database.search("needle", 2)
+        second = self.database.search("needle", 2, 2)
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(all("needle" in row["snippet"] for row in first + second))
+        self.assertFalse({r["message_id"] for r in first} & {r["message_id"] for r in second})
+        self.assertEqual(len(self.database.search("100%")), 5)
+        self.assertEqual(len(self.database.search("a_b")), 5)
+        self.assertEqual(self.database.search("100_"), [])
+
     def test_conversation_and_message_lifecycle(self) -> None:
         conversation = self.database.create_conversation(
             "Workspace", self.temp_dir.name, "antigravity"

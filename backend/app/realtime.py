@@ -98,6 +98,7 @@ class QueueItem:
     is_summary: bool = False
     covered_through_id: int = 0
     queued_at: str = field(default_factory=_utc_now)
+    request_id: str | None = None
 
     def as_dict(self, position: int) -> dict[str, object]:
         return {
@@ -120,11 +121,14 @@ class TaskState:
     model: str
     run_id: str
     user_content: str
+    request_id: str | None = None
     is_summary: bool = False
     summary_covered_through_id: int = 0
     input_chars: int = 0
     context_chars: int = 0
     start_time: float = field(default_factory=time.monotonic)
+    last_activity_time: float = field(default_factory=time.monotonic)
+    status_message: str = ""
     content: str = ""
     thought: str = ""
     sequence: int = 0
@@ -143,6 +147,7 @@ class AgentCoordinator:
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._states: dict[int, TaskState] = {}
         self._queues: dict[int, list[QueueItem]] = {}
+        self._starting: set[int] = set()
         self._lock = asyncio.Lock()
 
     def _build_queue_item(
@@ -181,15 +186,32 @@ class AgentCoordinator:
         model: str | None,
         provider_id: str | None,
         is_summary: bool = False,
+        request_id: str | None = None,
     ) -> dict[str, object]:
-        item = self._build_queue_item(
-            conversation,
-            content=content,
-            model=model,
-            provider_id=provider_id,
-            is_summary=is_summary,
-        )
         async with self._lock:
+            # The deterministic key survives lost acknowledgements and server
+            # restarts. A retry returns the stored run, never executes it again.
+            run_id = (f"{conversation.id}-{uuid.uuid5(uuid.NAMESPACE_URL, request_id).hex}"
+                      if request_id else None)
+            if run_id:
+                previous = await asyncio.to_thread(self.database.get_run, run_id)
+                if previous:
+                    if (previous["prompt"].strip() != content.strip()
+                            or (model and previous["model"] != model)
+                            or (provider_id and previous["provider"] != provider_id)):
+                        raise ValueError("Request ID already belongs to another message")
+                    queue = self._queues.get(conversation.id, [])
+                    previous["position"] = next(
+                        (i + 1 for i, queued in enumerate(queue) if queued.run_id == run_id), 0
+                    )
+                    return previous
+            item = self._build_queue_item(
+                conversation, content=content, model=model,
+                provider_id=provider_id, is_summary=is_summary,
+            )
+            if run_id:
+                item.run_id = run_id
+                item.request_id = request_id
             existing = self._tasks.get(conversation.id)
             is_busy = bool(existing and not existing.done())
             await asyncio.to_thread(
@@ -294,44 +316,49 @@ class AgentCoordinator:
     async def _start_locked(self, item: QueueItem) -> None:
         """Start `item` now. The caller holds `self._lock`."""
         conversation = item.conversation
-        history, augmented_prompt = await asyncio.to_thread(self._prepare_run, item)
+        self._starting.add(conversation.id)
+        try:
+            history, augmented_prompt = await asyncio.to_thread(self._prepare_run, item)
 
-        context_chars = sum(len(message.content) for message in history)
-        state = TaskState(
-            provider=item.provider,
-            model=item.model,
-            run_id=item.run_id,
-            user_content=item.content,
-            is_summary=item.is_summary,
-            summary_covered_through_id=item.covered_through_id,
-            input_chars=len(item.content),
-            context_chars=context_chars,
-        )
-        self._states[conversation.id] = state
+            context_chars = sum(len(message.content) for message in history)
+            state = TaskState(
+                provider=item.provider,
+                model=item.model,
+                run_id=item.run_id,
+                user_content=item.content,
+                request_id=item.request_id,
+                is_summary=item.is_summary,
+                summary_covered_through_id=item.covered_through_id,
+                input_chars=len(item.content),
+                context_chars=context_chars,
+            )
+            self._states[conversation.id] = state
 
-        request = AgentRequest(
-            run_id=item.run_id,
-            conversation_id=conversation.id,
-            working_directory=conversation.path,
-            prompt=augmented_prompt,
-            history=history,
-            model=item.model,
-            permission_mode=conversation.permission_mode,
-        )
-        provider = self.providers.get(item.provider)
-        await asyncio.to_thread(
-            self.database.update_run,
-            item.run_id,
-            status="running",
-            started_at=_utc_now(),
-            input_chars=state.input_chars,
-            context_chars=context_chars,
-        )
-        task = asyncio.create_task(
-            self._execute(conversation.id, provider, request, state),
-            name=f"agent-{conversation.id}-{request.run_id}",
-        )
-        self._tasks[conversation.id] = task
+            request = AgentRequest(
+                run_id=item.run_id,
+                conversation_id=conversation.id,
+                working_directory=conversation.path,
+                prompt=augmented_prompt,
+                history=history,
+                model=item.model,
+                permission_mode=conversation.permission_mode,
+            )
+            provider = self.providers.get(item.provider)
+            await asyncio.to_thread(
+                self.database.update_run,
+                item.run_id,
+                status="running",
+                started_at=_utc_now(),
+                input_chars=state.input_chars,
+                context_chars=context_chars,
+            )
+            task = asyncio.create_task(
+                self._execute(conversation.id, provider, request, state),
+                name=f"agent-{conversation.id}-{request.run_id}",
+            )
+            self._tasks[conversation.id] = task
+        finally:
+            self._starting.discard(conversation.id)
 
     @staticmethod
     def _augment_prompt(
@@ -378,6 +405,17 @@ class AgentCoordinator:
             return state.duration
         return round(time.monotonic() - state.start_time, 1)
 
+    @staticmethod
+    def _health_status(state: TaskState) -> str:
+        if state.status_message:
+            return "retrying"
+        inactive = time.monotonic() - state.last_activity_time
+        if inactive >= 120.0:
+            return "stalled"
+        if inactive >= 45.0:
+            return "slow"
+        return "active"
+
     def _state_message(
         self,
         conversation_id: int,
@@ -385,12 +423,17 @@ class AgentCoordinator:
         event_type: str,
         **values: object,
     ) -> dict[str, object]:
+        inactive_seconds = max(0.0, round(time.monotonic() - state.last_activity_time, 1))
         return {
             "type": event_type,
             "conversation_id": conversation_id,
             "run_id": state.run_id,
+            "request_id": state.request_id,
             "sequence": state.sequence,
             "elapsed": self._elapsed(state),
+            "inactive_seconds": inactive_seconds,
+            "health_status": self._health_status(state),
+            "status_message": state.status_message,
             "model": state.model,
             "provider": state.provider,
             "input_chars": state.input_chars,
@@ -428,10 +471,15 @@ class AgentCoordinator:
         )
 
         async def emit(event: AgentEvent) -> None:
+            state.last_activity_time = time.monotonic()
             if event.type == "token":
                 state.content += event.content
+                state.status_message = ""
             elif event.type == "thought":
                 state.thought += event.content
+                state.status_message = ""
+            elif event.type == "status":
+                state.status_message = event.content
             state.sequence += 1
             await self.hub.broadcast(
                 conversation_id,
@@ -724,21 +772,30 @@ class AgentCoordinator:
 
     def is_running(self, conversation_id: int) -> bool:
         task = self._tasks.get(conversation_id)
-        return bool(task and not task.done())
+        return (
+            bool(task and not task.done())
+            or conversation_id in self._starting
+            or bool(self._queues.get(conversation_id))
+        )
 
     def sync_message(self, conversation_id: int) -> dict[str, object] | None:
         state = self._states.get(conversation_id)
         if state is None:
             return None
+        inactive_seconds = max(0.0, round(time.monotonic() - state.last_activity_time, 1))
         return {
             "type": "sync_state",
             "conversation_id": conversation_id,
             "run_id": state.run_id,
+            "request_id": state.request_id,
             "sequence": state.sequence,
             "content": state.content,
             "thought": state.thought,
             "in_thought": True,
             "elapsed": self._elapsed(state),
+            "inactive_seconds": inactive_seconds,
+            "health_status": self._health_status(state),
+            "status_message": state.status_message,
             "model": state.model,
             "provider": state.provider,
             "user_content": state.user_content,

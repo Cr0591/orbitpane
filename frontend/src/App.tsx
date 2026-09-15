@@ -131,6 +131,7 @@ export default function App() {
   const scrollAnimationFrameRef = useRef<number | null>(null)
   const pendingAutoScrollTopRef = useRef<number | null>(null)
   const conversationScrollPositionsRef = useRef(new Map<number, number>())
+  const conversationReadAnchorsRef = useRef(new Map<number, { messageId: number; offset: number }>())
   const pullGestureRef = useRef<{
     startX: number
     startY: number
@@ -163,6 +164,11 @@ export default function App() {
     messages,
     setMessages,
     isHistoryLoading,
+    historyError,
+    hasOlderHistory,
+    isOlderHistoryLoading,
+    loadOlderHistory,
+    loadAllHistory,
     isConnected,
     isReconnecting,
     socketRef,
@@ -174,7 +180,7 @@ export default function App() {
     loadHistory,
     connectWebSocket,
     disconnectCurrentSocket,
-  } = useWebSocket(activeConvRef, showToast, loadConversations, scrollToBottom)
+  } = useWebSocket(activeConvRef, showToast, loadConversations)
 
   // Drawer state
   const isDesktopRef = useRef(window.innerWidth >= 1024)
@@ -697,17 +703,30 @@ export default function App() {
     scheduleScrollToBottom()
   }, [isLoggedIn, messages, scheduleScrollToBottom])
 
-  const selectConversation = (conv: Conversation, updateUrl = true) => {
+  const rememberReadingPosition = (conversationId: number) => {
+    const container = messagesContainerRef.current
+    if (!container) return
+    conversationScrollPositionsRef.current.set(conversationId, container.scrollTop)
+    const top = container.getBoundingClientRect().top
+    const anchor = [...container.querySelectorAll<HTMLElement>('[data-virtual-message-id]')]
+      .find(element => element.getBoundingClientRect().bottom > top)
+    if (anchor && !isNearBottom()) {
+      conversationReadAnchorsRef.current.set(conversationId, {
+        messageId: Number(anchor.dataset.virtualMessageId), offset: anchor.getBoundingClientRect().top - top,
+      })
+    } else conversationReadAnchorsRef.current.delete(conversationId)
+  }
+
+  const selectConversation = (conv: Conversation, updateUrl = true, restorePosition = true) => {
     triggerVibration()
     const isDifferentConversation = activeConvRef.current?.id !== conv.id
     const previousConversationId = activeConvRef.current?.id
     if (previousConversationId && messagesContainerRef.current) {
-      conversationScrollPositionsRef.current.set(previousConversationId, messagesContainerRef.current.scrollTop)
+      rememberReadingPosition(previousConversationId)
     }
     activeConvRef.current = conv
     setActiveConv(conv)
     shouldAutoScrollRef.current = true
-    historyRequestRef.current += 1
     if (isDifferentConversation) {
       isAgentThinkingRef.current = false
       setMessages([])
@@ -722,12 +741,28 @@ export default function App() {
       window.history.pushState({}, '', url.toString())
     }
 
-    loadHistory(conv.id)?.then(msgs => {
-      if (msgs) {
+    const loading = loadHistory(conv.id)
+    connectWebSocket(conv, false)
+    return loading.then(async msgs => {
+      const anchor = restorePosition ? conversationReadAnchorsRef.current.get(conv.id) : undefined
+      if (anchor && msgs && shouldAutoScrollRef.current) {
+        while (msgs.length && msgs[0].id! > anchor.messageId && activeConvRef.current?.id === conv.id) {
+          const older = await loadOlderHistory()
+          if (!older || older.length <= msgs.length) break
+          msgs = older
+        }
+        if (activeConvRef.current?.id === conv.id && shouldAutoScrollRef.current
+          && msgs.some(message => message.id === anchor.messageId)) {
+          shouldAutoScrollRef.current = false
+          setFocusedMessage({ conversationId: conv.id, ...anchor })
+        }
+      }
+      if (msgs && activeConvRef.current?.id === conv.id) {
         const last = msgs.findLast(m => m.model)
         if (conv.preferred_model) setSelectedModel(conv.preferred_model)
         else if (last?.model) setSelectedModel(last.model)
         window.requestAnimationFrame(() => {
+          if (activeConvRef.current?.id !== conv.id || !shouldAutoScrollRef.current) return
           const savedPosition = conversationScrollPositionsRef.current.get(conv.id)
           if (messagesContainerRef.current && savedPosition !== undefined) {
             shouldAutoScrollRef.current = false
@@ -737,8 +772,8 @@ export default function App() {
           }
         })
       }
+      return msgs
     })
-    connectWebSocket(conv, false)
   }
 
   useEffect(() => {
@@ -849,6 +884,7 @@ export default function App() {
       return
     }
 
+    const requestId = crypto.randomUUID()
     setInput('')
     shouldAutoScrollRef.current = true
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
@@ -858,6 +894,7 @@ export default function App() {
       ...prev,
       {
         localId: nextLocalId(),
+        request_id: requestId,
         role: 'user',
         content: textToSend.trim(),
         timestamp: new Date().toISOString(),
@@ -866,6 +903,7 @@ export default function App() {
       },
       {
         localId: nextLocalId(),
+        request_id: requestId,
         role: 'agent',
         content: '',
         thought: '',
@@ -879,34 +917,36 @@ export default function App() {
     ])
     
     const payload = {
+      request_id: requestId,
       content: textToSend.trim(),
       model: selectedModel,
       provider: conversation.provider,
     }
 
+    const pending = pendingSendMessagesRef.current.get(conversation.id) || []
+    pendingSendMessagesRef.current.set(conversation.id, [...pending, payload])
     const currentSocket = socketRef.current
     if (
       !currentSocket
       || currentSocket.readyState !== WebSocket.OPEN
       || socketConversationIdRef.current !== conversation.id
     ) {
-      const pending = pendingSendMessagesRef.current.get(conversation.id) || []
-      pendingSendMessagesRef.current.set(conversation.id, [...pending, payload])
       showToast('连接中，重连成功后将自动发送…', 'info')
       connectWebSocket(conversation, true)
       return
     }
 
-    currentSocket.send(JSON.stringify(payload))
+    try {
+      currentSocket.send(JSON.stringify(payload))
+    } catch {
+      connectWebSocket(conversation, true)
+      return
+    }
     if (willQueue) showToast('任务已加入队列', 'info')
   }
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value)
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`
-    }
   }
 
   const clearMessages = () => {
@@ -987,6 +1027,40 @@ export default function App() {
       .catch(() => showToast('复制失败，请检查浏览器权限', 'error'))
   }, [showToast])
 
+  const [focusedMessage, setFocusedMessage] = useState<{ conversationId: number; messageId: number; offset?: number } | null>(null)
+  const handledFocusRef = useRef<typeof focusedMessage>(null)
+
+  useEffect(() => {
+    if (!focusedMessage || focusedMessage.conversationId !== activeConversationId || handledFocusRef.current === focusedMessage) return
+    shouldAutoScrollRef.current = false
+    let frame = window.requestAnimationFrame(() => {
+      frame = window.requestAnimationFrame(() => {
+        const element = messagesContentRef.current?.querySelector<HTMLElement>(`[data-message-id="${focusedMessage.messageId}"]`)
+        const container = messagesContainerRef.current
+        if (!element || !container) return
+        if (focusedMessage.offset !== undefined) {
+          container.scrollTop += element.getBoundingClientRect().top - container.getBoundingClientRect().top - focusedMessage.offset
+        } else element.scrollIntoView({ block: 'center' })
+        handledFocusRef.current = focusedMessage
+      })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [focusedMessage, activeConversationId, messages.length])
+
+  const showOlderHistory = async () => {
+    const container = messagesContainerRef.current
+    const anchor = container ? [...container.querySelectorAll<HTMLElement>('[data-virtual-message-id]')]
+      .find(element => element.getBoundingClientRect().bottom > container.getBoundingClientRect().top) : undefined
+    const top = anchor?.getBoundingClientRect().top
+    shouldAutoScrollRef.current = false
+    await loadOlderHistory()
+    window.requestAnimationFrame(() => {
+      if (container && anchor?.isConnected && top !== undefined) {
+        container.scrollTop += anchor.getBoundingClientRect().top - top
+      }
+    })
+  }
+
   const exportConversationAsImage = async () => {
     const targetElement = messagesContentRef.current || messagesContainerRef.current
     const hasConversationMessages = messages.some(message => message.role !== 'system')
@@ -1004,7 +1078,13 @@ export default function App() {
     }
 
     try {
+      const exportConversationId = activeConv.id
+      if (!await loadAllHistory() || activeConvRef.current?.id !== exportConversationId) {
+        throw new Error('Conversation changed during export')
+      }
       const { toBlob } = await import('html-to-image')
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+      await document.fonts.ready
       
       const backgroundColor = getComputedStyle(document.documentElement)
         .getPropertyValue('--bg-primary')
@@ -1253,7 +1333,7 @@ export default function App() {
   const showProjectHome = () => {
     const conversationId = activeConvRef.current?.id
     if (conversationId && messagesContainerRef.current) {
-      conversationScrollPositionsRef.current.set(conversationId, messagesContainerRef.current.scrollTop)
+      rememberReadingPosition(conversationId)
     }
     activeConvRef.current = null
     setActiveConv(null)
@@ -1386,6 +1466,19 @@ export default function App() {
             <span>{isPullRefreshing ? '正在同步' : pullDistance >= 54 ? '松开刷新' : '下拉刷新'}</span>
           </div>
           <div className="chat-message-list" ref={messagesContentRef}>
+            {historyError && activeConv && (
+              <div className="history-sync-status" role="status">
+                <span>{historyError}</span>
+                <button type="button" onClick={() => void loadHistory(activeConv.id)} disabled={isHistoryLoading}>重试同步</button>
+              </div>
+            )}
+            {isHistoryLoading && messages.length > 0 && <div className="history-sync-status" role="status">正在同步历史记录…</div>}
+            {hasOlderHistory && !isExporting && (
+              <button className="history-load-older" type="button" disabled={isOlderHistoryLoading}
+                onClick={() => void showOlderHistory()}>
+                {isOlderHistoryLoading ? '正在加载…' : '加载更早消息'}
+              </button>
+            )}
             {(isHistoryLoading && (!activeConv || messages.filter(m => m.role !== 'system').length === 0)) ? (
               <div className="chat-history-loading" aria-label="正在加载对话">
                 <div className="history-skeleton history-skeleton-agent skeleton-shimmer" />
@@ -1406,6 +1499,8 @@ export default function App() {
               <MessageList
                 key={activeConv.id}
                 messages={messages}
+                renderAll={isExporting}
+                focusedMessageId={focusedMessage?.conversationId === activeConv.id ? focusedMessage.messageId : undefined}
                 copiedMessageKey={copiedMessageKey}
                 isAgentThinking={!!isAgentThinking}
                 isDrawerSwiping={drawer.isDragging}
@@ -1449,7 +1544,6 @@ export default function App() {
             handleKeyDown={handleKeyDown}
             sendMessage={sendMessage}
             isAgentThinking={!!isAgentThinking}
-            isConnected={isConnected}
             textareaRef={textareaRef}
             isNearBottom={isNearBottom}
             scrollToBottom={scrollToBottom}
@@ -1458,7 +1552,6 @@ export default function App() {
             models={models}
             loadModels={loadModels}
             socketRef={socketRef}
-            connectWebSocket={connectWebSocket}
             showToast={showToast}
             setIsDrawerOpen={setIsDrawerOpen}
           />
@@ -1487,17 +1580,22 @@ export default function App() {
           onExportImage={exportConversationAsImage}
           onSelectConv={(id, messageId) => {
             const found = visibleConversations.find(c => c.id === id)
-            if (found) {
-              selectConversation(found)
-              if (messageId) {
-                window.setTimeout(() => {
-                  document.querySelector(`[data-message-id="${messageId}"]`)?.scrollIntoView({
-                    block: 'center',
-                    behavior: 'smooth',
-                  })
-                }, 350)
+            if (!found) return
+            if (messageId) setFocusedMessage({ conversationId: id, messageId })
+            void (async () => {
+              let loaded = await selectConversation(found, true, false)
+              if (!messageId) return
+              shouldAutoScrollRef.current = false
+              while (loaded?.length && !loaded.some(message => message.id === messageId)
+                && loaded[0].id! > messageId && activeConvRef.current?.id === id) {
+                const older = await loadOlderHistory()
+                if (!older || older.length <= loaded.length) break
+                loaded = older
               }
-            }
+              if (activeConvRef.current?.id === id && !loaded?.some(message => message.id === messageId)) {
+                showToast('未能加载目标消息，请重试搜索', 'warning')
+              }
+            })()
           }}
           conversations={visibleConversations}
           showToast={showToast}

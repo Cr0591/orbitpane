@@ -133,6 +133,45 @@ class AntigravityProviderTests(IsolatedAsyncioTestCase):
             self.assertEqual(completed_responses, ["Recovered final answer"])
             self.assertEqual(emitted, [])
 
+    async def test_follow_log_detects_retry_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log_path = root / "antigravity.log"
+            log_path.write_text(
+                "Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model on the server), retrying in 4s\n",
+                encoding="utf-8",
+            )
+            emitted: list[AgentEvent] = []
+
+            async def emit(event: AgentEvent) -> None:
+                emitted.append(event)
+
+            task = asyncio.create_task(AntigravityProvider._follow_log(log_path, emit))
+            for _ in range(50):
+                if emitted:
+                    break
+                await asyncio.sleep(0.02)
+
+            self.assertTrue(len(emitted) >= 1)
+            self.assertEqual(emitted[0].type, "status")
+            self.assertIn("503", emitted[0].content)
+
+            # Test recovery
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write("URL: streamGenerateContent?alt=sse\n")
+
+            for _ in range(50):
+                if len(emitted) >= 2:
+                    break
+                await asyncio.sleep(0.02)
+
+            self.assertEqual(len(emitted), 2)
+            self.assertEqual(emitted[1].type, "status")
+            self.assertEqual(emitted[1].content, "")
+
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_run_reports_the_cli_reason_for_an_empty_answer(self) -> None:
         """Exit 0 with no stdout: stderr holds the only explanation there is."""
         with tempfile.TemporaryDirectory() as temp_dir:

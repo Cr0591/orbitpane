@@ -71,6 +71,42 @@ class AgentCoordinatorTests(IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.fail("Agent task did not finish")
 
+    async def test_submission_retries_are_idempotent_running_queued_and_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "retry.db")
+            database.migrate()
+            conversation = database.create_conversation("Retry", temp_dir, "fake")
+            provider = BlockingProvider()
+            coordinator = AgentCoordinator(database, FakeRegistry(provider), RecordingHub())
+            async def submit(request_id: str, content: str = "same prompt"):
+                return await coordinator.submit(conversation, content=content,
+                    model="test-model", provider_id="fake", request_id=request_id)
+            try:
+                first, retry = await asyncio.gather(submit("one"), submit("one"))
+                self.assertEqual(first["run_id"], retry["run_id"])
+                queued = await submit("two")
+                queued_retry = await submit("two")
+                self.assertEqual(queued["run_id"], queued_retry["run_id"])
+                self.assertEqual(queued_retry["position"], 1)
+                self.assertEqual(len(database.list_runs()), 2)
+                with self.assertRaises(ValueError):
+                    await submit("one", "different content")
+                provider.release.set()
+                await self.wait_until_finished(coordinator, conversation.id)
+                final = await submit("one")
+                self.assertEqual(final["run_id"], first["run_id"])
+                self.assertEqual(len(database.list_messages(conversation.id)), 4)
+                # Persistence still deduplicates after coordinator replacement.
+                restarted = AgentCoordinator(database, FakeRegistry(provider), RecordingHub())
+                replay = await restarted.submit(conversation, content="same prompt",
+                    model="test-model", provider_id="fake", request_id="one")
+                self.assertEqual(replay["run_id"], first["run_id"])
+                self.assertFalse(restarted.is_running(conversation.id))
+                await restarted.shutdown()
+            finally:
+                provider.release.set()
+                await coordinator.shutdown()
+
     async def test_busy_message_is_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Database(
@@ -322,6 +358,39 @@ class AgentCoordinatorTests(IsolatedAsyncioTestCase):
             event_count = len(hub.messages)
             await asyncio.sleep(0.03)
             self.assertEqual(len(hub.messages), event_count)
+
+    async def test_task_health_status_and_activity_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "orbitpane-test.db")
+            database.migrate()
+            conversation = database.create_conversation("Test", temp_dir, "fake")
+            provider = BlockingProvider()
+            hub = RecordingHub()
+            coordinator = AgentCoordinator(
+                database,
+                FakeRegistry(provider),  # type: ignore[arg-type]
+                hub,
+            )
+            from backend.app.realtime import TaskState
+            state = TaskState(
+                provider="fake",
+                model="test-model",
+                run_id="run-1",
+                user_content="hello",
+            )
+            self.assertEqual(coordinator._health_status(state), "active")
+            msg = coordinator._state_message(1, state, "elapsed")
+            self.assertEqual(msg["health_status"], "active")
+            self.assertIn("inactive_seconds", msg)
+
+            state.last_activity_time -= 50
+            self.assertEqual(coordinator._health_status(state), "slow")
+
+            state.last_activity_time -= 80
+            self.assertEqual(coordinator._health_status(state), "stalled")
+
+            state.status_message = "模型重试中..."
+            self.assertEqual(coordinator._health_status(state), "retrying")
 
 
 class AugmentPromptTests(TestCase):

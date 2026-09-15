@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { apiFetch } from '../lib/api'
+import { apiFetch, describeApiError } from '../lib/api'
 import { AUTH_EXPIRED_EVENT } from '../lib/auth'
 import { bindRunLocalId, ensureLocalId, ensureLocalIds } from '../lib/messageIdentity'
 import { asOptionalText, asText, normalizeMessages } from '../lib/normalize'
@@ -9,6 +9,7 @@ import type { Conversation, Message, TaskRecord } from '../lib/types'
 
 export interface RealtimeEvent {
   type: string
+  request_id?: string
   conversation_id?: number
   run_id?: string
   sequence?: number
@@ -19,6 +20,9 @@ export interface RealtimeEvent {
   full_thought?: string
   elapsed?: number
   duration?: number
+  inactive_seconds?: number
+  health_status?: 'active' | 'retrying' | 'slow' | 'stalled'
+  status_message?: string
   model?: string
   provider?: string
   code?: string
@@ -57,13 +61,16 @@ function moveResponseAfterPrompt(
  * eventual replies appear beside the wrong prompts. Acknowledgements arrive in
  * send order; bind the oldest matching optimistic turn instead.
  */
-export function applySubmittedTask(messages: Message[], task: TaskRecord): Message[] {
+export function applySubmittedTask(messages: Message[], task: TaskRecord, requestId?: string): Message[] {
   const next = [...messages]
-  let userIndex = next.findIndex(message => (
+  let userIndex = requestId ? next.findIndex(message => (
+    message.role === 'user' && message.request_id === requestId
+  )) : -1
+  if (userIndex < 0) userIndex = next.findIndex(message => (
     message.role === 'user' && message.run_id === task.run_id
   ))
 
-  if (userIndex < 0) {
+  if (userIndex < 0 && !requestId) {
     const optimisticUserIndexes = next.flatMap((message, index) => (
       message.role === 'user' && message.isOptimistic && !message.run_id
         ? [index]
@@ -85,6 +92,16 @@ export function applySubmittedTask(messages: Message[], task: TaskRecord): Messa
     }
   }
 
+  if (userIndex < 0 && requestId) {
+    userIndex = next.length
+    next.push(ensureLocalId({ role: 'user', content: task.prompt, request_id: requestId, run_id: task.run_id }))
+    next.push(ensureLocalId({ role: 'agent', content: '', request_id: requestId, run_id: task.run_id, isOptimistic: true }))
+  }
+  if (userIndex >= 0 && requestId) {
+    const user = next[userIndex]
+    next[userIndex] = { ...user, run_id: task.run_id, isOptimistic: false }
+    if (user.localId) bindRunLocalId('user', task.run_id, user.localId)
+  }
   let agentIndex = next.findIndex(message => (
     message.role === 'agent' && message.run_id === task.run_id
   ))
@@ -111,6 +128,7 @@ export function applySubmittedTask(messages: Message[], task: TaskRecord): Messa
 
   if (agentIndex >= 0) {
     const isQueued = task.status === 'queued'
+    const isTerminal = !['queued', 'starting', 'running'].includes(task.status)
     const currentAgent = next[agentIndex]
     const hasAlreadyStarted = (
       currentAgent.streamSequence !== undefined && !currentAgent.isQueued
@@ -118,7 +136,8 @@ export function applySubmittedTask(messages: Message[], task: TaskRecord): Messa
     const keepCurrentState = currentAgent.streamFinished || hasAlreadyStarted
     next[agentIndex] = {
       ...currentAgent,
-      isThinking: keepCurrentState ? currentAgent.isThinking : !isQueued,
+      isThinking: isTerminal ? false : (keepCurrentState ? currentAgent.isThinking : !isQueued),
+      ...(isTerminal ? { streamFinished: true } : {}),
       isQueued: keepCurrentState ? currentAgent.isQueued : isQueued,
       queuePosition: keepCurrentState
         ? currentAgent.queuePosition
@@ -149,7 +168,7 @@ function ensureRunAgent(
       if (
         message.role === 'user'
         && !message.run_id
-        && message.content === event.user_content
+        && (event.request_id ? message.request_id === event.request_id : message.content === event.user_content)
       ) {
         userIndex = index
         next[index] = { ...message, run_id: runId, isOptimistic: false }
@@ -236,8 +255,11 @@ function ensureRunAgent(
   return { messages: next, agentIndex }
 }
 
-export function applyRealtimeEvent(messages: Message[], event: RealtimeEvent): Message[] {
-  const ensured = ensureRunAgent(messages, event)
+export function applyRealtimeEvent(
+  messages: Message[], event: RealtimeEvent,
+  prepared?: { messages: Message[]; agentIndex: number },
+): Message[] {
+  const ensured = prepared ?? ensureRunAgent(messages, event)
   const next = ensured.messages
   const current = next[ensured.agentIndex]
   const currentSequence = current.streamSequence ?? -1
@@ -252,6 +274,9 @@ export function applyRealtimeEvent(messages: Message[], event: RealtimeEvent): M
     ...(event.model ? { model: event.model } : {}),
     ...(event.provider ? { provider: event.provider } : {}),
     ...(elapsed !== undefined ? { elapsedSoFar: elapsed } : {}),
+    ...(isFiniteNumber(event.inactive_seconds) ? { inactiveSeconds: event.inactive_seconds } : {}),
+    ...(event.health_status ? { healthStatus: event.health_status } : {}),
+    ...(event.status_message !== undefined ? { statusMessage: event.status_message } : {}),
     isOptimistic: false,
   }
 
@@ -280,6 +305,13 @@ export function applyRealtimeEvent(messages: Message[], event: RealtimeEvent): M
       streamSequence: incomingSequence,
     }
   } else if (event.type === 'elapsed') {
+    next[ensured.agentIndex] = {
+      ...current,
+      ...common,
+      isThinking: true,
+      isQueued: false,
+    }
+  } else if (event.type === 'status') {
     next[ensured.agentIndex] = {
       ...current,
       ...common,
@@ -321,6 +353,9 @@ export function applyRealtimeEvent(messages: Message[], event: RealtimeEvent): M
       isThinking: false,
       isQueued: false,
       streamFinished: true,
+      healthStatus: undefined,
+      statusMessage: undefined,
+      inactiveSeconds: undefined,
       streamSequence: Math.max(currentSequence, incomingSequence),
       ...(duration !== undefined
         ? { thinkingDuration: duration, elapsedSoFar: duration }
@@ -331,6 +366,34 @@ export function applyRealtimeEvent(messages: Message[], event: RealtimeEvent): M
     }
   }
 
+  return next
+}
+
+/** One array copy and one run index per frame, independent of token count. */
+export function applyRealtimeEvents(messages: Message[], events: RealtimeEvent[]): Message[] {
+  let next = [...messages]
+  const agents = new Map<string, number>()
+  const users = new Map<string, number>()
+  const indexRuns = () => {
+    agents.clear()
+    users.clear()
+    next.forEach((message, index) => {
+      if (!message.run_id) return
+      if (message.role === 'agent') agents.set(message.run_id, index)
+      if (message.role === 'user') users.set(message.run_id, index)
+    })
+  }
+  indexRuns()
+  for (const event of events) {
+    const index = event.run_id ? agents.get(event.run_id) : undefined
+    const userIndex = event.run_id ? users.get(event.run_id) : undefined
+    if (index !== undefined && (userIndex !== undefined ? index === userIndex + 1 : !event.user_content)) {
+      applyRealtimeEvent(next, event, { messages: next, agentIndex: index })
+    } else {
+      next = applyRealtimeEvent(next, event)
+      indexRuns()
+    }
+  }
   return next
 }
 
@@ -355,6 +418,7 @@ export function mergeHistoryWithTransientMessages(
     message.isOptimistic
     || (message.run_id !== undefined && trackedRunIds.has(message.run_id))
     || (message.isThinking && !message.run_id)
+    || message.deliveryFailed
     || message.role === 'system'
   ))
 
@@ -418,8 +482,7 @@ export function useWebSocket(
    */
   activeConvRef: React.MutableRefObject<Conversation | null>,
   showToast: (msg: string) => void,
-  loadConversations: (isInitial?: boolean) => void,
-  scrollToBottom: (smooth?: boolean) => void
+  loadConversations: (isInitial?: boolean) => void
 ) {
   const [messages, setMessages] = useState<Message[]>([])
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
@@ -433,17 +496,13 @@ export function useWebSocket(
   const lastPongRef = useRef(Date.now())
   const reconnectAttemptRef = useRef<number>(0)
   const historyRequestRef = useRef(0)
-  /**
-   * How many history loads are in flight.
-   *
-   * The skeleton comes down when this reaches zero, rather than on the success
-   * path of one particular request. A reply that lost its race used to return
-   * early with the flag still raised, and the request that supersedes it is
-   * usually a silent background refresh that never lowers it — so a cold start
-   * whose first load raced the socket's own `ready` refresh kept its skeleton
-   * up until the user switched projects.
-   */
-  const historyInFlightRef = useRef(0)
+  const [historyError, setHistoryError] = useState('')
+  const [hasOlderHistory, setHasOlderHistory] = useState(false)
+  const [isOlderHistoryLoading, setIsOlderHistoryLoading] = useState(false)
+  const historyStateRef = useRef<{ id: number; items: Message[]; firstId: number } | null>(null)
+  const historyFlightRef = useRef<{ id: number; promise: Promise<Message[] | null>; controller: AbortController } | null>(null)
+  const olderFlightRef = useRef<Promise<Message[] | null> | null>(null)
+  const refreshAgainRef = useRef(false)
   /**
    * Stream events waiting to be folded into `messages`, with the conversation
    * each one belongs to.
@@ -460,7 +519,7 @@ export function useWebSocket(
   const streamFrameRef = useRef<number | null>(null)
   const pendingSendMessagesRef = useRef(new Map<
     number,
-    Array<{ content: string; model: string; provider: string }>
+    Array<{ request_id: string; content: string; model: string; provider: string }>
   >())
 
   const isAgentThinking = messages.some(message => (
@@ -488,13 +547,9 @@ export function useWebSocket(
     streamBufferRef.current = []
     setMessages(previous => {
       const conversationId = activeConvRef.current?.id
-      let next = previous
-      for (const entry of queued) {
-        // Re-checked here rather than on arrival: the reader can move to
-        // another project between an event being queued and the frame landing.
-        if (entry.conversationId !== conversationId) continue
-        next = applyRealtimeEvent(next, entry.event)
-      }
+      const events = queued.filter(entry => entry.conversationId === conversationId).map(entry => entry.event)
+      if (events.length === 0) return previous
+      const next = applyRealtimeEvents(previous, events)
       if (next === previous) return previous
       isAgentThinkingRef.current = next.some(message => (
         message.role === 'agent' && message.isThinking
@@ -539,55 +594,126 @@ export function useWebSocket(
     setIsReconnecting(false)
   }, [clearStreamBuffer])
 
-  const loadHistory = useCallback((convId: number, silent = false) => {
-    if (!silent) setIsHistoryLoading(true)
-    const requestId = ++historyRequestRef.current
-    historyInFlightRef.current += 1
-    const settle = () => {
-      historyInFlightRef.current -= 1
-      if (historyInFlightRef.current === 0) setIsHistoryLoading(false)
+  const publishHistory = useCallback((items: Message[]) => {
+    const firstId = historyStateRef.current?.firstId ?? 0
+    setMessages(current => mergeHistoryWithTransientMessages(items, current.filter(message => (
+      message.id !== undefined
+        ? firstId > 0 && message.id >= firstId
+        : !message.streamFinished || firstId > 0
+    ))))
+  }, [])
+
+  const loadHistory = useCallback((convId: number, silent = false, refreshAgain = false): Promise<Message[] | null> => {
+    const flight = historyFlightRef.current
+    if (flight?.id === convId && !flight.controller.signal.aborted) {
+      if (refreshAgain) refreshAgainRef.current = true
+      return flight.promise
     }
-    /** Whether this reply still describes what the reader is looking at. */
-    const isCurrent = () => (
-      requestId === historyRequestRef.current
-      && activeConvRef.current?.id === convId
-    )
-    return apiFetch<Message[]>(`/api/history/${convId}`)
-      .then(data => {
-        settle()
-        if (!isCurrent()) return null
-        // Normalized before it is cached, so a bad row cannot be replayed from
-        // localStorage on every later load either.
-        const history = normalizeMessages(data)
-        cacheHistory(convId, history)
-        let finalMerged: Message[] = []
-        setMessages(current => {
-          const merged = mergeHistoryWithTransientMessages(history, current)
-          isAgentThinkingRef.current = merged.some(message => (
-            message.role === 'agent' && message.isThinking
-          ))
-          finalMerged = merged
-          return merged
-        })
-        setTimeout(() => scrollToBottom(false), 100)
-        return finalMerged
-      })
-      .catch(err => {
-        console.error(err)
-        settle()
-        if (isCurrent()) {
-          const cached = normalizeMessages(readCachedHistory<unknown>(convId, []))
-          setMessages(current => {
-            const merged = mergeHistoryWithTransientMessages(cached, current)
-            isAgentThinkingRef.current = merged.some(message => (
-              message.role === 'agent' && message.isThinking
-            ))
-            return merged
-          })
+    flight?.controller.abort()
+    const controller = new AbortController()
+    const requestId = ++historyRequestRef.current
+    const isCurrent = () => activeConvRef.current?.id === convId && historyRequestRef.current === requestId
+    if (historyStateRef.current?.id !== convId) {
+      const cached = ensureLocalIds(normalizeMessages(readCachedHistory<unknown>(convId, [])))
+      historyStateRef.current = { id: convId, items: cached, firstId: 0 }
+      publishHistory(cached)
+      setHasOlderHistory(cached.length > 0)
+      setIsOlderHistoryLoading(false)
+      olderFlightRef.current = null
+    }
+    if (!silent) setIsHistoryLoading(true)
+    setHistoryError('')
+    const promise = (async () => {
+      try {
+        do {
+          refreshAgainRef.current = false
+          let more = true
+          while (more) {
+            const snapshot = historyStateRef.current!
+            const lastId = snapshot.items.at(-1)?.id
+            const page = await apiFetch<{ items: Message[]; has_more: boolean; first_id: number }>(
+              `/api/history/${convId}?limit=60${lastId ? `&after_id=${lastId}` : ''}`,
+              { signal: controller.signal },
+            )
+            if (!isCurrent()) return null
+            const incoming = ensureLocalIds(normalizeMessages(page.items))
+            const current = historyStateRef.current!
+            const rows = new Map(current.items.filter(item => page.first_id > 0 && item.id! >= page.first_id).map(item => [item.id!, item]))
+            incoming.forEach(item => rows.set(item.id!, item))
+            const items = [...rows.values()].sort((a, b) => a.id! - b.id!)
+            historyStateRef.current = { id: convId, items, firstId: page.first_id }
+            setHasOlderHistory(!!items.length && items[0].id! > page.first_id)
+            publishHistory(items)
+            cacheHistory(convId, items.slice(-60))
+            more = !!lastId && page.has_more
+          }
+        } while (refreshAgainRef.current)
+        return historyStateRef.current!.items
+      } catch (error) {
+        if (isCurrent() && !controller.signal.aborted) {
+          setHistoryError(describeApiError(error, '历史同步失败，当前内容可能不完整'))
         }
         return null
-      })
-  }, [activeConvRef, scrollToBottom])
+      } finally {
+        if (historyFlightRef.current?.controller === controller) {
+          historyFlightRef.current = null
+          setIsHistoryLoading(false)
+        }
+      }
+    })()
+    historyFlightRef.current = { id: convId, promise, controller }
+    return promise
+  }, [activeConvRef, publishHistory])
+
+  const loadOlderHistory = useCallback((): Promise<Message[] | null> => {
+    if (olderFlightRef.current) return olderFlightRef.current
+    const snapshot = historyStateRef.current
+    if (!snapshot || activeConvRef.current?.id !== snapshot.id || !snapshot.items[0]?.id) return Promise.resolve(null)
+    const convId = snapshot.id
+    const requestId = historyRequestRef.current
+    setIsOlderHistoryLoading(true)
+    const promise = apiFetch<{ items: Message[]; has_more: boolean; first_id: number }>(
+      `/api/history/${convId}?limit=60&before_id=${snapshot.items[0].id}`,
+    ).then(page => {
+      if (activeConvRef.current?.id !== convId || historyStateRef.current?.id !== convId
+        || historyRequestRef.current !== requestId) return null
+      const current = historyStateRef.current
+      const rows = new Map([...ensureLocalIds(normalizeMessages(page.items)), ...current.items].map(item => [item.id!, item]))
+      const items = [...rows.values()].filter(item => item.id! >= page.first_id).sort((a, b) => a.id! - b.id!)
+      historyStateRef.current = { id: convId, items, firstId: page.first_id }
+      setHasOlderHistory(page.has_more)
+      setHistoryError('')
+      publishHistory(items)
+      return items
+    }).catch(error => {
+      if (activeConvRef.current?.id === convId) setHistoryError(describeApiError(error, '较早消息加载失败，请重试'))
+      return null
+    }).finally(() => {
+      if (olderFlightRef.current === promise) {
+        olderFlightRef.current = null
+        setIsOlderHistoryLoading(false)
+      }
+    })
+    olderFlightRef.current = promise
+    return promise
+  }, [activeConvRef, publishHistory])
+
+  const loadAllHistory = useCallback(async () => {
+    const convId = activeConvRef.current?.id
+    if (!convId) return null
+    await historyFlightRef.current?.promise
+    if (activeConvRef.current?.id !== convId) return null
+    const requestId = historyRequestRef.current
+    const rows = await apiFetch<Message[]>(`/api/history/${convId}`)
+    if (activeConvRef.current?.id !== convId || historyRequestRef.current !== requestId) return null
+    const items = ensureLocalIds(normalizeMessages(rows))
+    historyStateRef.current = { id: convId, items, firstId: items[0]?.id ?? 0 }
+    setHasOlderHistory(false)
+    publishHistory(items)
+    return items
+  }, [activeConvRef, publishHistory])
+
+  useEffect(() => () => { historyFlightRef.current?.controller.abort() }, [])
 
   const connectWebSocket = useCallback((conv: Conversation, isManual = false) => {
     if (reconnectTimerRef.current) {
@@ -650,7 +776,6 @@ export function useWebSocket(
       const pending = pendingSendMessagesRef.current.get(conv.id) || []
       if (pending.length > 0) {
         awaitingPendingStart = true
-        pendingSendMessagesRef.current.delete(conv.id)
         pending.forEach(message => ws.send(JSON.stringify(message)))
       }
 
@@ -680,7 +805,12 @@ export function useWebSocket(
 
         if (data.type === 'submitted' && data.task) {
           const task = data.task
-          setMessages(previous => applySubmittedTask(previous, task))
+          if (data.request_id) {
+            const pending = pendingSendMessagesRef.current.get(conv.id) || []
+            pendingSendMessagesRef.current.set(conv.id, pending.filter(message => message.request_id !== data.request_id))
+          }
+          setMessages(previous => applySubmittedTask(previous, task, data.request_id))
+          if (!['queued', 'starting', 'running'].includes(task.status)) loadHistory(conv.id, true, true)
           emitTaskChange()
           return
         }
@@ -715,6 +845,12 @@ export function useWebSocket(
           isAgentThinkingRef.current = false
           awaitingPendingStart = false
           pendingSendMessagesRef.current.delete(conv.id)
+          historyFlightRef.current?.controller.abort()
+          historyFlightRef.current = null
+          historyStateRef.current = { id: conv.id, items: [], firstId: 0 }
+          setHasOlderHistory(false)
+          setIsHistoryLoading(false)
+          setHistoryError('')
           remove(`orbitpane_history_${conv.id}`)
           setMessages([])
           emitTaskChange()
@@ -738,6 +874,7 @@ export function useWebSocket(
           data.type === 'start'
           || data.type === 'sync_state'
           || data.type === 'elapsed'
+          || data.type === 'status'
           || data.type === 'thought'
           || data.type === 'token'
           || data.type === 'answer'
@@ -752,13 +889,14 @@ export function useWebSocket(
           if (
             data.type === 'start'
             || data.type === 'sync_state'
+            || data.type === 'status'
             || data.type === 'done'
           ) {
             flushStreamBuffer()
           }
           if (data.type === 'done') {
             loadConversations(false)
-            loadHistory(conv.id, true)
+            loadHistory(conv.id, true, true)
             emitTaskChange()
             if (
               document.visibilityState !== 'visible'
@@ -795,10 +933,19 @@ export function useWebSocket(
             || data.code === 'not_found'
           )
           if (requestRejected) awaitingPendingStart = false
+          if (requestRejected && data.request_id) {
+            const pending = pendingSendMessagesRef.current.get(conv.id) || []
+            pendingSendMessagesRef.current.set(conv.id, pending.filter(message => message.request_id !== data.request_id))
+          }
           setMessages(previous => {
             if (activeConvRef.current?.id !== conv.id) return previous
             const next = requestRejected
-              ? previous.filter(message => !message.isOptimistic)
+              ? previous.flatMap(message => {
+                  if (!data.request_id || message.request_id !== data.request_id) return [message]
+                  return message.role === 'user'
+                    ? [{ ...message, isOptimistic: false, deliveryFailed: true }]
+                    : []
+                })
               : [...previous]
             next.push({
               role: 'system',
@@ -864,6 +1011,11 @@ export function useWebSocket(
     messages,
     setMessages,
     isHistoryLoading,
+    historyError,
+    hasOlderHistory,
+    isOlderHistoryLoading,
+    loadOlderHistory,
+    loadAllHistory,
     isConnected,
     isReconnecting,
     socketRef,

@@ -6,6 +6,9 @@ import type { FileSearchItem } from '../lib/types'
 interface FileMentionPickerProps {
   items: FileSearchItem[]
   loading: boolean
+  error: string
+  truncated: boolean
+  onRetry: () => void
   query: string
   activeIndex: number
   workspacePath: string
@@ -35,6 +38,9 @@ function FileTypeIcon({ name }: { name: string }) {
 export function FileMentionPicker({
   items,
   loading,
+  error,
+  truncated,
+  onRetry,
   query,
   activeIndex,
   workspacePath,
@@ -86,7 +92,11 @@ export function FileMentionPicker({
           </button>
         ))}
 
-        {!loading && items.length === 0 && (
+        {!loading && error && <div className="file-mention-status" role="status">
+          {error} <button type="button" onClick={onRetry}>重试</button>
+        </div>}
+        {!loading && !error && truncated && <div className="file-mention-status" role="status">仅显示部分结果，请输入更完整的文件名或路径。</div>}
+        {!loading && !error && !truncated && items.length === 0 && (
           <div className="file-mention-empty">
             {query ? `没有找到“${query}”` : '当前项目内没有可引用的文件'}
           </div>
