@@ -3,15 +3,21 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { LogoIcon } from '../LogoIcon'
 import { apiFetch, ApiError } from '../lib/api'
 import { loginWithPasskey, passkeyError, supportsPasskeys } from '../lib/passkeys'
-import { Lock, AlertCircle, Fingerprint } from 'lucide-react'
+import { readText, writeText } from '../lib/storage'
+import { Lock, AlertCircle, UserRoundKey } from 'lucide-react'
 import './Login.css'
+
+type LoginMethod = 'pin' | 'passkey'
+const LOGIN_METHOD_KEY = 'orbitpane_last_login_method'
 
 export function Login({ onLogin }: { onLogin: () => void }) {
   const [pin, setPin] = useState('')
-  const [error, setError] = useState('')
+  const [error, setError] = useState<{ method: LoginMethod; message: string } | null>(null)
   const passkeysSupported = supportsPasskeys()
-  const [usePin, setUsePin] = useState(!passkeysSupported)
-  const [loading, setLoading] = useState(false)
+  const [usePin, setUsePin] = useState(() => !passkeysSupported || readText(LOGIN_METHOD_KEY) === 'pin')
+  const [loadingMethod, setLoadingMethod] = useState<LoginMethod | null>(null)
+  const loading = loadingMethod !== null
+  const pinError = error?.method === 'pin'
   const inputRef = useRef<HTMLInputElement>(null)
 
   /* The screen sizes itself to the visual viewport, so the field is normally
@@ -34,9 +40,9 @@ export function Login({ onLogin }: { onLogin: () => void }) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!pin) return
-    setLoading(true)
-    setError('')
+    if (loading || !pin.trim()) return
+    setLoadingMethod('pin')
+    setError(null)
 
     try {
       const data = await apiFetch<{ success: boolean }>('/api/login', {
@@ -44,29 +50,32 @@ export function Login({ onLogin }: { onLogin: () => void }) {
         body: JSON.stringify({ pin })
       })
       if (data.success) {
+        writeText(LOGIN_METHOD_KEY, 'pin')
         onLogin()
       } else {
         throw new Error('Invalid PIN')
       }
     } catch (error) {
-      setError(error instanceof ApiError && error.status === 401 ? 'PIN 不正确，请重试。'
-        : error instanceof ApiError && error.status === 429 ? '尝试次数过多，请稍后重试。' : '登录失败，请检查网络后重试。')
+      setError({ method: 'pin', message: error instanceof ApiError && error.status === 401 ? 'PIN 不正确，请重试。'
+        : error instanceof ApiError && error.status === 429 ? '尝试次数过多，请稍后重试。' : '登录失败，请检查网络后重试。' })
       setPin('')
     } finally {
-      setLoading(false)
+      setLoadingMethod(null)
     }
   }
 
   const handlePasskey = async () => {
-    setLoading(true)
-    setError('')
+    if (loading) return
+    setLoadingMethod('passkey')
+    setError(null)
     try {
       await loginWithPasskey()
+      writeText(LOGIN_METHOD_KEY, 'passkey')
       onLogin()
     } catch (error) {
-      setError(passkeyError(error))
+      setError({ method: 'passkey', message: passkeyError(error) })
     } finally {
-      setLoading(false)
+      setLoadingMethod(null)
     }
   }
 
@@ -85,57 +94,67 @@ export function Login({ onLogin }: { onLogin: () => void }) {
           </div>
 
           <div className="login-form-area">
-            {!usePin && (
-              <>
-                <button type="button" className="login-submit-btn" disabled={loading} onClick={handlePasskey}>
-                  {loading ? <div className="login-spinner" /> : <><Fingerprint size={20} />使用通行密钥登录</>}
-                </button>
-                <p className="login-passkey-hint">使用 Face ID、Touch ID 或设备通行密钥。<br />首次使用请先用 PIN 登录，再在侧栏绑定。</p>
-              </>
-            )}
             {usePin && <form onSubmit={handleSubmit} className="login-form-area">
               <div className="login-input-group">
-                <label className="login-input-label">访问 PIN</label>
+                <label htmlFor="login-pin" className="login-input-label">访问 PIN</label>
                 <div className="login-input-wrapper">
                   <input
+                    id="login-pin"
                     ref={inputRef}
                     type="password"
+                    autoComplete="current-password"
                     value={pin}
-                    onChange={e => { setPin(e.target.value); setError(''); }}
+                    onChange={e => { setPin(e.target.value); setError(null); }}
                     // The resize listener catches the keyboard opening; this catches
                     // a re-focus while it is already up, when no resize fires.
                     onFocus={() => window.setTimeout(revealInput, 300)}
                     placeholder="输入访问 PIN"
-                    className={`login-input ${error ? 'login-input-error' : ''}`}
+                    className={`login-input ${pinError ? 'login-input-error' : ''}`}
                     autoFocus
                     disabled={loading}
                     aria-label="输入访问 PIN"
+                    aria-invalid={pinError}
+                    aria-describedby={pinError ? 'login-error' : undefined}
                   />
-                  <Lock className="login-input-icon" size={18} strokeWidth={2.5} />
+                  <Lock className="login-input-icon" size={18} strokeWidth={2.5} aria-hidden="true" />
                 </div>
-
-
               </div>
 
               <button
                 type="submit"
                 disabled={loading || !pin.trim()}
-                className="login-submit-btn"
-                aria-label={loading ? '正在验证' : '提交 PIN'}
+                className={`login-submit-btn${passkeysSupported ? ' login-pin-submit' : ''}`}
+                aria-busy={loadingMethod === 'pin'}
+                aria-label={loadingMethod === 'pin' ? '正在使用 PIN 登录' : '使用 PIN 登录'}
               >
-                {loading ? <div className="login-spinner" /> : '登录'}
+                {loadingMethod === 'pin' && <span className="login-spinner" aria-hidden="true" />}
+                <span>使用 PIN 登录</span>
               </button>
             </form>}
+            {usePin && passkeysSupported && <div className="login-method-divider" aria-hidden="true" />}
+            {passkeysSupported && <button
+              type="button"
+              className="login-submit-btn login-passkey-btn"
+              disabled={loading}
+              onClick={handlePasskey}
+              aria-busy={loadingMethod === 'passkey'}
+              aria-label={loadingMethod === 'passkey' ? '正在使用通行密钥登录' : '使用通行密钥登录'}
+            >
+              {loadingMethod === 'passkey'
+                ? <span className="login-spinner" aria-hidden="true" />
+                : <UserRoundKey size={20} aria-hidden="true" />}
+              <span>使用通行密钥登录</span>
+            </button>}
             <AnimatePresence>
-              {error && <motion.div role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="login-error-message">
-                <AlertCircle size={14} /><span>{error}</span>
+              {error && <motion.div id="login-error" role="alert" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="login-error-message">
+                <AlertCircle size={14} aria-hidden="true" /><span>{error.message}</span>
               </motion.div>}
             </AnimatePresence>
-            {passkeysSupported ? (
-              <button type="button" className="login-switch-btn" disabled={loading} onClick={() => { setUsePin(!usePin); setError(''); setPin('') }}>
-                {usePin ? '改用通行密钥登录' : '使用 PIN 登录'}
+            {passkeysSupported && !usePin && (
+              <button type="button" className="login-switch-btn" disabled={loading} onClick={() => { setUsePin(true); setError(null); setPin('') }}>
+                使用 PIN 登录
               </button>
-            ) : <p className="login-passkey-hint">当前环境不支持通行密钥，请使用 PIN 登录。通行密钥需要 HTTPS 和支持的浏览器。</p>}
+            )}
           </div>
 
         </div>

@@ -227,7 +227,8 @@
 
 .login-submit-btn {
   width: 100%;
-  height: 44px;
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3-5);
   border-radius: var(--radius-md);
   border: none;
   background: var(--brand-primary);
@@ -240,17 +241,14 @@
   justify-content: center;
   gap: var(--space-2);
   cursor: pointer;
-  transition: background-color var(--transition-fast), opacity var(--transition-fast);
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), opacity var(--transition-fast);
 }
 
 .login-submit-btn:hover:not(:disabled) {
-  background: var(--accent-color);
+  /* Keep white labels at the brand fill's contrast level in both themes. */
+  background: color-mix(in srgb, var(--brand-primary) 88%, black);
 }
 
-/* Empty is the screen's opening state, so the button spends most of its life
-   disabled. Turning it into a grey slab made the whole composition read as
-   inert; keeping the fill and dropping the opacity keeps one colour anchor
-   on the page and still reads as unavailable. */
 .login-submit-btn:disabled {
   cursor: not-allowed;
   opacity: 0.4;
@@ -259,9 +257,9 @@
 .login-spinner {
   width: 18px;
   height: 18px;
-  border: 2px solid rgba(255, 255, 255, 0.3);
+  border: 2px solid currentColor;
   border-radius: 50%;
-  border-top-color: var(--on-brand);
+  border-right-color: transparent;
   animation: spin 0.8s linear infinite;
 }
 
@@ -286,20 +284,9 @@
   visibility: hidden;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .login-screen::before { display: none; }
-}
-
-/* Below these heights the column no longer fits the strip, and scrolling a
-   login form is a worse answer than dropping decoration: the lockup says which
-   machine this is, the field is the whole purpose of the screen.
-
-   A size query measures the container's *content box* — the strip less its
-   padding — and the column measures 238px whole, 207px without the subtitle
-   and 100px as bare field-and-button. Each step therefore hands the next one
-   about 17px more than it needs, which is the room for iOS metrics running
-   taller than the numbers above (measured in Chrome). Under ~100px the field
-   still scrolls into view; no keyboard leaves a strip that thin. */
+/* Size queries measure the space actually left above the keyboard. Hide the
+   subtitle and then the brand when that space is short; the PIN form and the
+   passkey action stay reachable inside the scroll container. */
 @container login (max-height: 256px) {
   .login-brand-sub { display: none; }
 }
@@ -308,21 +295,60 @@
   .login-header { display: none; }
 }
 
-.login-passkey-hint {
-  margin: 0;
-  text-align: center;
-  color: var(--text-tertiary);
-  font-size: var(--text-xs);
-  line-height: 1.7;
+/* PIN stays ready for the remembered habit; the filled passkey action carries
+   the visual emphasis and starts authentication directly. */
+.login-pin-submit {
+  background: var(--bg-input);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.login-pin-submit:hover:not(:disabled) {
+  background: var(--bg-surface-hover);
+  border-color: var(--text-tertiary);
+}
+
+.login-method-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin-block: var(--space-2);
+}
+
+.login-passkey-btn {
+  min-height: 48px;
 }
 
 .login-switch-btn {
   min-height: 44px;
+  padding: var(--space-2) var(--space-3-5);
   background: transparent;
-  border: 1px solid var(--border-color);
+  border: none;
   border-radius: var(--radius-md);
   color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
   cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
+}
+
+.login-switch-btn:hover:not(:disabled) {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
 }
 
 .login-switch-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.login-submit-btn:focus-visible,
+.login-switch-btn:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-screen::before { display: none; }
+  .login-submit-btn,
+  .login-switch-btn,
+  .login-input { transition: none; }
+  .login-spinner { animation: none; }
+}

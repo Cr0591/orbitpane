@@ -144,8 +144,10 @@ refuses to start without both authentication settings.
 
 ### Passkey login (iOS and other supported devices)
 
-The login screen defaults to **使用通行密钥登录**; **使用 PIN 登录** remains
-available. First sign in with your existing PIN, then select **绑定通行密钥**
+The browser remembers the last successful sign-in method and opens it by default.
+With no saved preference, the login screen defaults to **使用通行密钥登录**;
+**使用 PIN 登录** remains available. In the PIN view, passkeys remain a prominent
+one-click action. First sign in with your existing PIN, then select **绑定通行密钥**
 in the sidebar. Accept the system prompt to save the passkey (for example in
 iCloud Keychain). Subsequent logins can use Face ID, Touch ID, or the device's
 verification method. Cancelling a prompt never removes the PIN fallback.
