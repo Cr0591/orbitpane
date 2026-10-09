@@ -109,6 +109,20 @@ class Database:
                     sign_count INTEGER NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 );
+                CREATE TABLE IF NOT EXISTS push_subscriptions (
+                    endpoint TEXT PRIMARY KEY,
+                    p256dh TEXT NOT NULL,
+                    auth TEXT NOT NULL,
+                    application_server_key TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS push_deliveries (
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt REAL NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, endpoint)
+                );
                 CREATE TABLE IF NOT EXISTS passkey_challenges (
                     id TEXT PRIMARY KEY,
                     challenge BLOB NOT NULL,
@@ -727,11 +741,67 @@ class Database:
         if not updates:
             return
         with self.connect() as connection:
+            # Persist notification work in the same transaction as completion.
+            # Repeated completion writes, reconnects and request retries cannot
+            # enqueue the same run twice, even after delivery has been removed.
+            if values.get("status") == "completed":
+                connection.execute(
+                    "INSERT OR IGNORE INTO push_deliveries(run_id, endpoint, created_at) "
+                    "SELECT r.run_id, s.endpoint, ? FROM runs r CROSS JOIN push_subscriptions s "
+                    "WHERE r.run_id = ? AND r.status != 'completed'",
+                    (time.time(), run_id),
+                )
             connection.execute(
                 f"UPDATE runs SET {', '.join(f'{key} = ?' for key, _ in updates)} "
                 "WHERE run_id = ?",
                 [value for _, value in updates] + [run_id],
             )
+
+    def save_push_subscription(self, subscription: dict[str, Any]) -> None:
+        with self.connect() as connection:
+            # OrbitPane has one authenticated workspace owner, with multiple
+            # devices. Bound storage even if a client keeps submitting new URLs.
+            if connection.execute(
+                "SELECT COUNT(*) FROM push_subscriptions WHERE endpoint != ?",
+                (subscription["endpoint"],),
+            ).fetchone()[0] >= 100:
+                raise ValueError("Too many push subscriptions")
+            connection.execute(
+                "INSERT INTO push_subscriptions VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh, "
+                "auth=excluded.auth, application_server_key=excluded.application_server_key",
+                (subscription["endpoint"], subscription["keys"]["p256dh"],
+                 subscription["keys"]["auth"], subscription["application_server_key"]),
+            )
+
+    def delete_push_subscription(self, endpoint: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+
+    def pending_push_deliveries(self, public_key: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM push_deliveries WHERE created_at < ?", (time.time() - 86400,))
+            # Key rotation invalidates the old browser subscriptions.
+            connection.execute("DELETE FROM push_subscriptions WHERE application_server_key != ?", (public_key,))
+            rows = connection.execute(
+                "SELECT d.*, s.p256dh, s.auth, r.conversation_id FROM push_deliveries d "
+                "JOIN push_subscriptions s ON s.endpoint = d.endpoint "
+                "JOIN runs r ON r.run_id = d.run_id "
+                "WHERE d.next_attempt <= ? ORDER BY d.next_attempt, d.created_at LIMIT 10",
+                (time.time(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_push_delivery(self, run_id: str, endpoint: str, *, retry: bool = False) -> None:
+        with self.connect() as connection:
+            if retry:
+                connection.execute(
+                    "UPDATE push_deliveries SET attempts=attempts+1, "
+                    "next_attempt=? + MIN(3600, 30 * (1 << MIN(attempts, 7))) "
+                    "WHERE run_id=? AND endpoint=?", (time.time(), run_id, endpoint),
+                )
+            else:
+                connection.execute("DELETE FROM push_deliveries WHERE run_id=? AND endpoint=?", (run_id, endpoint))
 
     def list_runs(
         self, *, conversation_id: int | None = None, limit: int = 100

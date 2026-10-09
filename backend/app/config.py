@@ -81,6 +81,8 @@ class Settings:
     codex_reasoning_summary: str
     codex_sandbox: str
     webauthn_origin: str = ""
+    push_vapid_private_key: str = ""
+    push_vapid_subject: str = ""
 
     @property
     def webauthn_rp_id(self) -> str:
@@ -129,6 +131,8 @@ class Settings:
             cors_origins=_csv(os.getenv("ORBITPANE_CORS_ORIGINS")),
             auth_pin=auth_pin,
             webauthn_origin=webauthn_origin,
+            push_vapid_private_key=os.getenv("ORBITPANE_PUSH_VAPID_PRIVATE_KEY", "").strip(),
+            push_vapid_subject=os.getenv("ORBITPANE_PUSH_VAPID_SUBJECT", "").strip(),
             auth_secret=auth_secret,
             auth_ttl_seconds=int(os.getenv("ORBITPANE_AUTH_TTL_SECONDS", "43200")),
             history_max_chars=int(os.getenv("ORBITPANE_HISTORY_MAX_CHARS", "120000")),

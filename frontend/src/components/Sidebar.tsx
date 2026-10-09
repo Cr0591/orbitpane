@@ -18,6 +18,8 @@ import { haptic } from '../lib/nativeFeedback'
 import { useFocusTrap } from '../hooks/useFocusTrap'
 import { useEscapeLayer } from '../hooks/useEscapeLayer'
 import { MobileBottomSheet } from './MobileBottomSheet'
+import { PushNotificationButton } from './PushNotificationButton'
+import { disablePush } from '../lib/push'
 
 import { useAppContext } from '../contexts/AppContext'
 
@@ -867,6 +869,7 @@ export function Sidebar({ isVisible, drawerX }: SidebarProps) {
 
           {/* Sidebar Global Footer */}
           <div className="sidebar-footer">
+            <PushNotificationButton />
             {supportsPasskeys() && <button
               type="button"
               className="sidebar-footer-btn"
@@ -888,10 +891,14 @@ export function Sidebar({ isVisible, drawerX }: SidebarProps) {
             </button>}
             <button 
               className="sidebar-footer-btn destructive"
-              onClick={() => {
-                apiFetch('/api/logout', { method: 'POST' }).finally(() => {
+              onClick={async () => {
+                try {
+                  await disablePush()
+                  await apiFetch('/api/logout', { method: 'POST' })
                   window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT))
-                })
+                } catch {
+                  showToast('退出失败，请稍后重试。', 'error')
+                }
               }}
               title="退出登录"
             >

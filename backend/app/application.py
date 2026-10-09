@@ -50,6 +50,8 @@ from .models import (
     ConversationUpdate,
     LoginRequest,
     PasskeyResponse,
+    PushEndpoint,
+    PushSubscription,
     Message,
     MessageFeedbackUpdate,
     QueueReorder,
@@ -58,6 +60,7 @@ from .models import (
     SummaryUpdate,
 )
 from .realtime import AgentCoordinator, ConnectionHub
+from .notifications import PushNotifications
 from .security import (
     LoginRateLimiter,
     SESSION_COOKIE_NAME,
@@ -383,6 +386,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     providers = ProviderRegistry(resolved_settings, store=database)
     hub = ConnectionHub()
     coordinator = AgentCoordinator(database, providers, hub)
+    notifications = PushNotifications(resolved_settings, database)
     # Walking a large workspace is CPU-bound Python holding the GIL, so running
     # many at once slows the event loop's own thread down, not just the walks.
     file_search_slots = asyncio.Semaphore(FILE_SEARCH_CONCURRENCY)
@@ -421,6 +425,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         database.migrate()
         sweeper = asyncio.create_task(sweep_dead_shares())
+        push_worker = asyncio.create_task(notifications.run())
         # Discovering models means shelling out to each agent CLI, so it runs
         # here rather than under the first request: a client that opens the app
         # right after a restart finds the caches already filled. Startup is not
@@ -431,6 +436,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prewarm.cancel()
         sweeper.cancel()
         await coordinator.shutdown()
+        push_worker.cancel()
+        await asyncio.gather(push_worker, return_exceptions=True)
 
     app = FastAPI(
         title="OrbitPane",
@@ -444,6 +451,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.providers = providers
     app.state.hub = hub
     app.state.coordinator = coordinator
+    app.state.notifications = notifications
     app.state.tokens = TokenService(
         resolved_settings.auth_pin,
         resolved_settings.auth_secret,
@@ -636,6 +644,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/session", dependencies=[Depends(require_auth)])
     async def session():
         return {"authenticated": True}
+
+    @app.get("/api/push/config", dependencies=[Depends(require_auth)])
+    async def push_config():
+        return {"enabled": notifications.enabled, "public_key": notifications.public_key}
+
+    @app.put("/api/push/subscription", dependencies=[Depends(require_auth)])
+    async def subscribe_push(payload: PushSubscription):
+        if not notifications.enabled:
+            raise HTTPException(status_code=503, detail="服务器尚未配置推送通知")
+        if payload.application_server_key != notifications.public_key:
+            raise HTTPException(status_code=409, detail="推送密钥已更新，请重新开启通知")
+        try:
+            await asyncio.to_thread(database.save_push_subscription, payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from None
+        return {"success": True}
+
+    @app.delete("/api/push/subscription", dependencies=[Depends(require_auth)])
+    async def unsubscribe_push(payload: PushEndpoint):
+        await asyncio.to_thread(database.delete_push_subscription, payload.endpoint)
+        return {"success": True}
 
     @app.post("/api/logout", dependencies=[Depends(require_auth)])
     async def logout(response: Response):

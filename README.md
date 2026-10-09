@@ -7,6 +7,58 @@ realtime execution and reconnect support without coupling the UI
 protocol to a specific agent provider. Google Antigravity is the default
 provider, with OpenAI Codex available behind a feature flag.
 
+## Task-completion push notifications
+
+iOS/iPadOS 16.4+ supports notifications for HTTPS PWAs installed on the Home
+Screen. OrbitPane uses standard Web Push with VAPID and encrypted payloads;
+Apple delivers these through APNs. No native APNs certificate, `.p8` key, or
+Apple Developer membership is needed. Chrome and Firefox Web Push also work.
+
+After installing backend dependencies, generate the server key once:
+
+```bash
+python3 -m backend.setup_push --subject https://your-orbitpane.example.com
+pm2 restart orbitpane-backend --update-env
+```
+
+This writes `ORBITPANE_PUSH_VAPID_PRIVATE_KEY` (base64url DER P-256 key) and
+`ORBITPANE_PUSH_VAPID_SUBJECT` into the gitignored `.env`, without printing the
+private key. Back up that key with the deployment configuration. Rotating it
+requires devices to enable notifications again. Without a key, push is disabled.
+The subject can also be a real `mailto:` contact address.
+
+On iPhone, use Safari's **Add to Home Screen**, open OrbitPane from that icon,
+log in, and select **开启任务通知** in the sidebar. Accept the system permission
+prompt. Existing installations should apply the app update first. The same
+button disables notifications on that device; explicit logout removes its
+subscription. Browser permission denial must be changed in system settings.
+
+Each successfully completed task, including queued tasks and summaries,
+notifies subscribed devices even when the app is closed. Failed or interrupted
+tasks do not send a success notification. Notifications contain only a generic
+completion message, and tapping one opens the corresponding conversation
+(`/?id=…`), with login required when the session has expired.
+
+Delivery jobs are persisted atomically with task completion and survive backend
+restarts. Network errors, HTTP 429 and 5xx responses retry with backoff for up
+to 24 hours; 404/410 subscriptions are removed. Clearing history, deleting a
+conversation, or unsubscribing removes its pending delivery jobs. The push
+service may accept a send just before a process crash; stable notification tags
+coalesce a retried send on the device. The host needs outbound HTTPS access to
+the browser's push service (Apple uses `*.push.apple.com`). This is a single-owner
+workspace: all devices that opted in receive completions across its projects.
+
+Notification regressions:
+
+```bash
+python3 -m unittest backend.tests.test_notifications -v
+node --test frontend/tests/push-worker.test.mjs
+```
+
+For a device check, start a task, background or close the PWA, wait for completion,
+and tap the notification to verify that the right conversation opens. Focus
+modes and system notification settings may affect presentation.
+
 ## Architecture
 
 ```text

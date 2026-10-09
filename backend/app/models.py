@@ -2,8 +2,64 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
+import base64
+import binascii
 
-from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives.asymmetric import ec
+from pydantic import BaseModel, Field, field_validator
+
+
+class PushEndpoint(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        # A subscription is an outbound request destination. Only browser push
+        # services are allowed, never arbitrary URLs supplied by a client.
+        try:
+            url = urlsplit(value)
+            host = url.hostname or ""
+            trusted = (
+                host == "web.push.apple.com" or host.endswith(".push.apple.com")
+                or host == "fcm.googleapis.com"
+                or host == "updates.push.services.mozilla.com"
+                or host.endswith(".notify.windows.com")
+            )
+            valid = (url.scheme == "https" and trusted and url.port in (None, 443)
+                     and not url.username and not url.password and not url.fragment
+                     and bool(url.path) and not any(c.isspace() for c in value))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Unsupported push service endpoint")
+        return value
+
+
+class PushKeys(BaseModel):
+    p256dh: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+=*$")
+    auth: str = Field(min_length=1, max_length=30, pattern=r"^[A-Za-z0-9_-]+=*$")
+
+    @field_validator("p256dh", "auth")
+    @classmethod
+    def validate_key(cls, value: str, info) -> str:
+        try:
+            raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            if info.field_name == "p256dh":
+                if len(raw) != 65:
+                    raise ValueError()
+                ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+            elif len(raw) != 16:
+                raise ValueError()
+        except (ValueError, binascii.Error):
+            raise ValueError("Invalid push encryption key") from None
+        return value
+
+
+class PushSubscription(PushEndpoint):
+    keys: PushKeys
+    application_server_key: str = Field(min_length=1, max_length=100)
 
 
 @dataclass(frozen=True, slots=True)
