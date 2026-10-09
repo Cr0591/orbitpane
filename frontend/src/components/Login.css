@@ -1,6 +1,6 @@
 /* Login Screen.
 
-   This is a PIN prompt for a single-user self-hosted tool, not a landing page,
+   This is a passkey and PIN prompt for a single-user self-hosted tool, not a landing page,
    so there is no marketing copy, no glass panel and no illustration. What it
    does need is *presence*: the previous version put a grey bordered card and a
    grey disabled button in the middle of a black field, which is the visual
@@ -307,3 +307,22 @@
 @container login (max-height: 224px) {
   .login-header { display: none; }
 }
+
+.login-passkey-hint {
+  margin: 0;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.7;
+}
+
+.login-switch-btn {
+  min-height: 44px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.login-switch-btn:disabled { opacity: 0.4; cursor: not-allowed; }

@@ -3091,7 +3091,7 @@
      jumping 60px the instant the tab changes. */
   .sidebar-footer {
     overflow: hidden;
-    max-height: 96px;
+    max-height: 160px;
     visibility: visible;
     transition:
       max-height 0.34s var(--ease-emphasis),

@@ -75,3 +75,27 @@ class SettingsTests(TestCase):
             settings = Settings.from_env()
 
         self.assertEqual(settings.codex_reasoning_summary, "concise")
+
+
+class WebAuthnConfigTests(TestCase):
+    def settings(self, origin, environment="development"):
+        with patch("backend.app.config.load_dotenv"), patch.dict(os.environ, {
+            "ORBITPANE_WEBAUTHN_ORIGIN": origin, "ORBITPANE_ENV": environment,
+            "ORBITPANE_PIN": "test-pin", "ORBITPANE_AUTH_SECRET": "test-secret",
+        }, clear=True):
+            return Settings.from_env()
+
+    def test_explicit_origin_and_rp_id(self):
+        settings = self.settings("https://orbitpane.example:8443/")
+        self.assertEqual(settings.webauthn_origin, "https://orbitpane.example:8443")
+        self.assertEqual(settings.webauthn_rp_id, "orbitpane.example")
+        self.assertEqual(self.settings("").webauthn_origin, "")
+        self.assertEqual(self.settings("http://localhost:5173").webauthn_rp_id, "localhost")
+
+    def test_untrusted_or_insecure_origins_rejected(self):
+        for origin in ["http://example.com", "https://example.com/path", "https://user@example.com",
+                       "https://example.com?query=1", "https://example.com#fragment", "example.com"]:
+            with self.subTest(origin=origin), self.assertRaises(RuntimeError):
+                self.settings(origin)
+        with self.assertRaises(RuntimeError):
+            self.settings("http://localhost:5173", "production")

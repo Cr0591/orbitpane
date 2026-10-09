@@ -5,6 +5,7 @@ import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,11 @@ class Settings:
     codex_models: tuple[str, ...]
     codex_reasoning_summary: str
     codex_sandbox: str
+    webauthn_origin: str = ""
+
+    @property
+    def webauthn_rp_id(self) -> str:
+        return urlsplit(self.webauthn_origin).hostname or ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +92,15 @@ class Settings:
         environment = os.getenv("ORBITPANE_ENV", "development").strip().lower()
         auth_pin = os.getenv("ORBITPANE_PIN", "")
         auth_secret = os.getenv("ORBITPANE_AUTH_SECRET", "")
+        webauthn_origin = os.getenv("ORBITPANE_WEBAUTHN_ORIGIN", "").strip().rstrip("/")
+        if webauthn_origin:
+            origin = urlsplit(webauthn_origin)
+            if (not origin.hostname or origin.username or origin.password
+                    or origin.path or origin.query or origin.fragment
+                    or (origin.scheme != "https" and not (
+                        origin.scheme == "http" and origin.hostname == "localhost"
+                        and environment != "production"))):
+                raise RuntimeError("ORBITPANE_WEBAUTHN_ORIGIN must be an HTTPS origin (HTTP localhost is allowed in development)")
 
         if environment == "production" and (not auth_pin or not auth_secret):
             raise RuntimeError(
@@ -113,6 +128,7 @@ class Settings:
             allowed_roots=_paths(os.getenv("ORBITPANE_ALLOWED_ROOTS")),
             cors_origins=_csv(os.getenv("ORBITPANE_CORS_ORIGINS")),
             auth_pin=auth_pin,
+            webauthn_origin=webauthn_origin,
             auth_secret=auth_secret,
             auth_ttl_seconds=int(os.getenv("ORBITPANE_AUTH_TTL_SECONDS", "43200")),
             history_max_chars=int(os.getenv("ORBITPANE_HISTORY_MAX_CHARS", "120000")),

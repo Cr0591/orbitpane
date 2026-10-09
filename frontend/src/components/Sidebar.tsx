@@ -6,12 +6,13 @@ import {
   ChevronRight, Compass, FolderPlus,
   Check, Pencil, Layers, HardDrive, RefreshCw, Cpu,
   Search, Star, LogOut, ChevronDown, Maximize2, Minimize2,
-  Archive, ArchiveRestore, ShieldAlert, ShieldCheck
+  Archive, ArchiveRestore, ShieldAlert, ShieldCheck, Fingerprint
 } from 'lucide-react'
 import { LogoIcon } from '../LogoIcon'
 import type { Conversation, Provider } from '../lib/types'
 import { hasProviderChoice } from '../lib/providers'
 import { apiFetch } from '../lib/api'
+import { registerPasskey, passkeyError, supportsPasskeys } from '../lib/passkeys'
 import { AUTH_EXPIRED_EVENT } from '../lib/auth'
 import { haptic } from '../lib/nativeFeedback'
 import { useFocusTrap } from '../hooks/useFocusTrap'
@@ -124,6 +125,7 @@ function ProviderDropdown({ providers, selectedProvider, defaultProvider, setSel
 }
 
 export function Sidebar({ isVisible, drawerX }: SidebarProps) {
+  const [bindingPasskey, setBindingPasskey] = useState(false)
   const {
     isDrawerOpen, drawerMode, setDrawerMode,
     conversations, isConversationsLoading, activeConv, selectConversation,
@@ -865,6 +867,25 @@ export function Sidebar({ isVisible, drawerX }: SidebarProps) {
 
           {/* Sidebar Global Footer */}
           <div className="sidebar-footer">
+            {supportsPasskeys() && <button
+              type="button"
+              className="sidebar-footer-btn"
+              disabled={bindingPasskey}
+              onClick={async () => {
+                setBindingPasskey(true)
+                try {
+                  await registerPasskey()
+                  showToast('通行密钥已绑定，下次可直接使用它登录')
+                } catch (error) {
+                  showToast(passkeyError(error), 'error')
+                } finally {
+                  setBindingPasskey(false)
+                }
+              }}
+            >
+              <Fingerprint size={16} />
+              <span>{bindingPasskey ? '正在绑定…' : '绑定通行密钥'}</span>
+            </button>}
             <button 
               className="sidebar-footer-btn destructive"
               onClick={() => {

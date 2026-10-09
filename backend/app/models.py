@@ -42,6 +42,10 @@ class LoginRequest(BaseModel):
     pin: str = Field(min_length=1, max_length=256)
 
 
+class PasskeyResponse(BaseModel):
+    credential: dict
+
+
 class ConversationCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     path: str = Field(min_length=1, max_length=4096)

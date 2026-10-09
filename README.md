@@ -75,6 +75,11 @@ Useful security settings:
 - `ORBITPANE_CORS_ORIGINS`: empty for same-origin deployments; otherwise a
   comma-separated explicit origin list.
 - `ORBITPANE_AUTH_TTL_SECONDS`: signed login token lifetime, default 12 hours.
+- `ORBITPANE_WEBAUTHN_ORIGIN`: exact public HTTPS origin for passkeys, for
+  example `https://orbitpane.hzycode.com`. The hostname is the WebAuthn RP ID;
+  it is never taken from request headers. For local Vite development use
+  `http://localhost:5173`. If unset, passkey operations are disabled and PIN
+  login continues to work.
 - `ORBITPANE_DATABASE_PATH`: SQLite database location. Tests always use an
   isolated temporary database and never share production persistence.
 - Agent filesystem permissions are selected per project. New projects default to
@@ -84,6 +89,26 @@ In development, an unset PIN and signing secret are replaced with process-local
 random values, so login credentials and sessions do not survive a restart.
 Configure both values explicitly when interactive login is needed. Production
 refuses to start without both authentication settings.
+
+### Passkey login (iOS and other supported devices)
+
+The login screen defaults to **使用通行密钥登录**; **使用 PIN 登录** remains
+available. First sign in with your existing PIN, then select **绑定通行密钥**
+in the sidebar. Accept the system prompt to save the passkey (for example in
+iCloud Keychain). Subsequent logins can use Face ID, Touch ID, or the device's
+verification method. Cancelling a prompt never removes the PIN fallback.
+Browsers without WebAuthn or a secure context show the PIN form directly.
+
+Registration requires an authenticated session. Both ceremonies verify the
+configured origin, RP ID, user verification and a browser-bound, single-use
+challenge expiring after five minutes. Public login options do not expose
+registered credential IDs. Public keys and signature counters persist in
+SQLite; private keys stay with the authenticator. Synced passkeys with zero
+signature counters are supported. Keep your PIN as a recovery method if a
+device or passkey is lost, and keep the public hostname stable.
+
+The backend uses [py_webauthn](https://duo-labs.github.io/py_webauthn/registration.html)
+for registration and signature verification.
 
 ## Development
 

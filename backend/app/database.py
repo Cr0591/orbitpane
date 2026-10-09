@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,12 +46,76 @@ class Database:
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
 
+    def passkey_ids(self) -> list[bytes]:
+        with self.connect() as connection:
+            return [row[0] for row in connection.execute("SELECT credential_id FROM passkeys")]
+
+    def get_passkey(self, credential_id: bytes) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM passkeys WHERE credential_id = ?", (credential_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def add_passkey(self, credential_id: bytes, public_key: bytes, sign_count: int) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "INSERT OR IGNORE INTO passkeys (credential_id, public_key, sign_count) VALUES (?, ?, ?)",
+                (credential_id, public_key, sign_count),
+            ).rowcount == 1
+
+    def update_passkey_counter(self, credential_id: bytes, old: int, new: int) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "UPDATE passkeys SET sign_count = ? WHERE credential_id = ? AND sign_count = ?",
+                (new, credential_id, old),
+            ).rowcount == 1
+
+    def save_passkey_challenge(self, challenge_id: str, challenge: bytes, purpose: str,
+                              session_hash: str, previous_id: str | None = None) -> bool:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM passkey_challenges WHERE expires_at <= ? OR id = ?",
+                               (time.time(), previous_id))
+            if connection.execute("SELECT count(*) FROM passkey_challenges").fetchone()[0] >= 1000:
+                return False
+            connection.execute(
+                "INSERT INTO passkey_challenges VALUES (?, ?, ?, ?, ?)",
+                (challenge_id, challenge, purpose, session_hash, time.time() + 300),
+            )
+            return True
+
+    def consume_passkey_challenge(self, challenge_id: str, purpose: str,
+                                 session_hash: str) -> bytes | None:
+        # DELETE RETURNING is atomic across processes: even invalid responses
+        # consume the ceremony, and a verified assertion cannot be replayed.
+        with self.connect() as connection:
+            row = connection.execute(
+                "DELETE FROM passkey_challenges WHERE id = ? RETURNING *", (challenge_id,)
+            ).fetchone()
+            if (row and row["expires_at"] > time.time() and row["purpose"] == purpose
+                    and row["session_hash"] == session_hash):
+                return row["challenge"]
+            return None
+
     def migrate(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS passkeys (
+                    credential_id BLOB PRIMARY KEY,
+                    public_key BLOB NOT NULL,
+                    sign_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                );
+                CREATE TABLE IF NOT EXISTS passkey_challenges (
+                    id TEXT PRIMARY KEY,
+                    challenge BLOB NOT NULL,
+                    purpose TEXT NOT NULL,
+                    session_hash TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import secrets
 import subprocess
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +28,16 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from webauthn import (
+    generate_authentication_options, generate_registration_options,
+    options_to_json, verify_authentication_response, verify_registration_response,
+)
+from webauthn.helpers import base64url_to_bytes
+from webauthn.helpers.exceptions import WebAuthnException
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria, PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement, UserVerificationRequirement,
+)
 
 from .agents.base import ProviderError
 from .agents.registry import ProviderRegistry
@@ -37,6 +49,7 @@ from .models import (
     ConversationCreate,
     ConversationUpdate,
     LoginRequest,
+    PasskeyResponse,
     Message,
     MessageFeedbackUpdate,
     QueueReorder,
@@ -52,6 +65,7 @@ from .security import (
     ShareTokenCipher,
     TokenService,
     authenticate_websocket,
+    bearer_token,
     hash_share_token,
     new_share_token,
     require_auth,
@@ -441,6 +455,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.share_cipher = share_cipher
     logging.getLogger("uvicorn.access").addFilter(ShareTokenLogFilter())
     app.state.login_limiter = LoginRateLimiter()
+    app.state.passkey_limiter = LoginRateLimiter(max_attempts=30, window_seconds=60)
     # Share tokens are far too large to guess, but the public lookup is the one
     # route a stranger can reach, so it gets the same bucketed backpressure the
     # PIN does rather than an unbounded read loop.
@@ -496,22 +511,127 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if app.state.tokens.verify_pin(payload.pin):
             app.state.login_limiter.reset(client_id)
-            token = app.state.tokens.issue()
-            response.set_cookie(
-                key=SESSION_COOKIE_NAME,
-                value=token,
-                max_age=resolved_settings.auth_ttl_seconds,
-                httponly=True,
-                secure=resolved_settings.environment == "production",
-                samesite=cookie_same_site,
-                path="/",
-            )
-            return {
-                "success": True,
-                "expires_in": resolved_settings.auth_ttl_seconds,
-            }
+            return issue_session(response)
         app.state.login_limiter.record_failure(client_id)
         raise HTTPException(status_code=401, detail="Invalid PIN")
+
+    def issue_session(response: Response) -> dict[str, object]:
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME, value=app.state.tokens.issue(),
+            max_age=resolved_settings.auth_ttl_seconds, httponly=True,
+            secure=resolved_settings.environment == "production",
+            samesite=cookie_same_site, path="/",
+        )
+        return {"success": True, "expires_in": resolved_settings.auth_ttl_seconds}
+
+    # Authentication ceremonies are public like /api/login. Registration is
+    # authenticated, and all four endpoints are restricted to the configured
+    # origin (never derived from an untrusted Host/forwarded header).
+    challenge_cookie = "orbitpane_webauthn"
+    passkey_user_id = b"orbitpane-user"
+
+    def check_passkey_request(request: Request) -> None:
+        if not resolved_settings.webauthn_origin:
+            raise HTTPException(503, "通行密钥尚未配置，请使用 PIN 登录")
+        if request.headers.get("origin") != resolved_settings.webauthn_origin:
+            raise HTTPException(403, "Invalid passkey origin")
+        client_id = request.client.host if request.client else "unknown"
+        if not app.state.passkey_limiter.check(client_id):
+            raise HTTPException(429, "操作过于频繁，请稍后重试")
+        app.state.passkey_limiter.record_failure(client_id)
+
+    def session_hash(request: Request, purpose: str) -> str:
+        return hashlib.sha256((bearer_token(request) or "").encode()).hexdigest() if purpose == "register" else ""
+
+    def save_ceremony(request: Request, response: Response, options: Any, purpose: str):
+        challenge_id = secrets.token_urlsafe(32)
+        if not database.save_passkey_challenge(
+            challenge_id, options.challenge, purpose, session_hash(request, purpose),
+            request.cookies.get(challenge_cookie),
+        ):
+            raise HTTPException(429, "操作过于频繁，请稍后重试")
+        response.set_cookie(
+            challenge_cookie, challenge_id, max_age=300, httponly=True,
+            secure=resolved_settings.environment == "production",
+            samesite=cookie_same_site, path="/api/passkeys",
+        )
+        return json.loads(options_to_json(options))
+
+    def consume_ceremony(request: Request, purpose: str) -> bytes:
+        challenge = database.consume_passkey_challenge(
+            request.cookies.get(challenge_cookie, ""), purpose, session_hash(request, purpose),
+        )
+        if challenge is None:
+            raise HTTPException(400, "验证已过期，请重试")
+        return challenge
+
+    @app.post("/api/passkeys/register/options", dependencies=[Depends(require_auth)])
+    async def passkey_register_options(request: Request, response: Response):
+        check_passkey_request(request)
+        options = generate_registration_options(
+            rp_id=resolved_settings.webauthn_rp_id, rp_name="OrbitPane",
+            user_id=passkey_user_id, user_name="OrbitPane", user_display_name="OrbitPane",
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                user_verification=UserVerificationRequirement.REQUIRED,
+            ),
+            exclude_credentials=[PublicKeyCredentialDescriptor(id=value) for value in database.passkey_ids()],
+        )
+        return save_ceremony(request, response, options, "register")
+
+    @app.post("/api/passkeys/register/verify", dependencies=[Depends(require_auth)])
+    async def passkey_register_verify(payload: PasskeyResponse, request: Request):
+        check_passkey_request(request)
+        challenge = consume_ceremony(request, "register")
+        try:
+            verified = verify_registration_response(
+                credential=payload.credential, expected_challenge=challenge,
+                expected_rp_id=resolved_settings.webauthn_rp_id,
+                expected_origin=resolved_settings.webauthn_origin,
+                require_user_verification=True,
+            )
+        except (WebAuthnException, ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(400, "通行密钥绑定验证失败，请重试") from exc
+        if not database.add_passkey(verified.credential_id, verified.credential_public_key, verified.sign_count):
+            raise HTTPException(409, "此通行密钥已绑定")
+        return {"success": True}
+
+    @app.post("/api/passkeys/login/options")
+    async def passkey_login_options(request: Request, response: Response):
+        check_passkey_request(request)
+        # Discoverable credentials let iCloud Keychain select the passkey;
+        # public responses do not disclose registered credential identifiers.
+        options = generate_authentication_options(
+            rp_id=resolved_settings.webauthn_rp_id,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
+        return save_ceremony(request, response, options, "login")
+
+    @app.post("/api/passkeys/login/verify")
+    async def passkey_login_verify(payload: PasskeyResponse, request: Request, response: Response):
+        check_passkey_request(request)
+        challenge = consume_ceremony(request, "login")
+        try:
+            credential = payload.credential
+            saved = database.get_passkey(base64url_to_bytes(credential["rawId"]))
+            if saved is None:
+                raise ValueError("Unknown credential")
+            user_handle = credential.get("response", {}).get("userHandle")
+            if not user_handle or base64url_to_bytes(user_handle) != passkey_user_id:
+                raise ValueError("Invalid user handle")
+            verified = verify_authentication_response(
+                credential=credential, expected_challenge=challenge,
+                expected_rp_id=resolved_settings.webauthn_rp_id,
+                expected_origin=resolved_settings.webauthn_origin,
+                credential_public_key=saved["public_key"],
+                credential_current_sign_count=saved["sign_count"],
+                require_user_verification=True,
+            )
+        except (WebAuthnException, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise HTTPException(400, "通行密钥验证失败，请重试或使用 PIN 登录") from exc
+        if not database.update_passkey_counter(verified.credential_id, saved["sign_count"], verified.new_sign_count):
+            raise HTTPException(400, "验证已过期，请重试")
+        return issue_session(response)
 
     @app.get("/api/session", dependencies=[Depends(require_auth)])
     async def session():
