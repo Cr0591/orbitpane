@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import AsyncIterator
 
 from ..config import Settings
 from .base import (
@@ -25,6 +26,24 @@ from .base import (
 from .process import terminate_process
 
 logger = logging.getLogger(__name__)
+
+
+async def _output_lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+    """Frame JSONL without StreamReader.readline's 64 KiB record limit.
+
+    Tool results may contain entire files in a single JSON record. Read bounded
+    chunks and assemble records before decoding, preserving split UTF-8 bytes.
+    """
+    pending = bytearray()
+    while chunk := await stream.read(64 * 1024):
+        parts = chunk.split(b"\n")
+        pending.extend(parts[0])
+        for part in parts[1:]:
+            yield bytes(pending)
+            pending.clear()
+            pending.extend(part)
+    if pending:
+        yield bytes(pending)
 
 #: Joins a model slug to the reasoning effort it is pinned to: `gpt-5.5@high`.
 #: Codex slugs never contain it, while a `-high` suffix would be ambiguous with
@@ -283,7 +302,7 @@ class CodexCliProvider(AgentProvider):
 
         try:
             assert process.stdout is not None
-            while raw_line := await process.stdout.readline():
+            async for raw_line in _output_lines(process.stdout):
                 try:
                     event = json.loads(raw_line)
                 except json.JSONDecodeError:

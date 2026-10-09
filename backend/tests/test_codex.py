@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from subprocess import CompletedProcess
@@ -10,6 +11,7 @@ from backend.app.agents.codex import (
     CodexCliProvider,
     fetch_codex_models,
     split_reasoning_effort,
+    _output_lines,
 )
 from backend.app.agents.base import AgentRequest
 from backend.app.config import Settings
@@ -323,8 +325,15 @@ class _FakeStream:
     async def readline(self) -> bytes:
         return self._lines.pop(0) if self._lines else b""
 
-    async def read(self) -> bytes:
-        return self._content
+    async def read(self, n: int = -1) -> bytes:
+        if self._lines:
+            self._content += b"".join(self._lines)
+            self._lines.clear()
+        if n < 0:
+            content, self._content = self._content, b""
+        else:
+            content, self._content = self._content[:n], self._content[n:]
+        return content
 
 
 class _FakeProcess:
@@ -341,6 +350,42 @@ class _FakeProcess:
 
 
 class CodexRunTests(IsolatedAsyncioTestCase):
+    async def test_large_jsonl_records_preserve_utf8_and_final_unterminated_line(self) -> None:
+        stream = asyncio.StreamReader()
+        records = [b"small", ("长输出" * 100000).encode(), b"last"]
+        stream.feed_data(b"\n".join(records))
+        stream.feed_eof()
+        self.assertEqual([line async for line in _output_lines(stream)], records)
+
+    async def test_run_accepts_large_tool_output_and_continues_to_final(self) -> None:
+        provider = CodexCliProvider(replace(
+            Settings.from_env(), codex_enabled=True, codex_models=("gpt-test",),
+        ))
+        process = _FakeProcess([])
+        process.stdout = asyncio.StreamReader()
+        for event in [
+            {"type": "item.completed", "item": {
+                "id": "tool", "type": "command_execution", "command": "cat file",
+                "aggregated_output": "x" * 200000,
+            }},
+            {"type": "item.completed", "item": {
+                "id": "final", "type": "agent_message", "text": "Done.",
+            }},
+        ]:
+            process.stdout.feed_data((json.dumps(event) + "\n").encode())
+        process.stdout.feed_eof()
+        request = AgentRequest(run_id="large", conversation_id=1,
+                               working_directory="/tmp", prompt="test",
+                               history=(), model="gpt-test")
+        with (
+            patch("backend.app.agents.codex.shutil.which", return_value="/bin/codex"),
+            patch("backend.app.agents.codex.asyncio.create_subprocess_exec",
+                  AsyncMock(return_value=process)),
+        ):
+            result = await provider.run(request, AsyncMock())
+        self.assertEqual(result.content, "Done.")
+        self.assertFalse(provider._processes)
+
     async def test_run_streams_commentary_but_keeps_latest_message_as_final(self) -> None:
         settings = replace(
             Settings.from_env(),
